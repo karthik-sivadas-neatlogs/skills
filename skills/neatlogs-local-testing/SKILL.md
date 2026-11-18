@@ -72,6 +72,17 @@ Inspect `neatlogs experiments record --help` and `neatlogs experiments round --h
 
 A changed dataset, check configuration or hypothesis requires a new setup/round; never mutate the setup frozen into earlier rounds. This tracking adds no human approval step in the Neatlogs UI.
 
+## Capture source before running
+
+Source capture is part of the normal experiment, even if an older copied prompt omits it. Inspect `experiments record --help` for `--source-file`. If unavailable, report the missing CLI capability and use a compatible build before running. New A/B rounds require source tracking by default. Use `--data-only` only for a comparison the user explicitly requested without code tracking.
+
+1. Identify the relevant agent source, prompt and tool files. Select explicit relative paths, not the entire repository. Exclude credentials, binary files and unrelated data. Capture A before editing any of those files.
+2. Send the normal `kind: "preparation"` checkpoint JSON on stdin to `neatlogs experiments record --experiment <id> --body-stdin --source-file path/to/agent.py path/to/prompt.txt`. Replace the paths with the actual selected files. The CLI saves their immutable contents and digest; a checksum in the message is not a source snapshot.
+3. Run A from that exact source before making candidate changes. After editing, capture B with the same selected paths and variant B. Include paths absent in either version so additions and deletions are represented. Local/non-Git folders are supported. Clean matching Git revisions receive real commit, branch and canonical repository metadata automatically. Do not invent Git identity for uncommitted code.
+4. Re-submit each variant's preparation with the same file selection immediately before every run or retry. A changed saved version is rejected. Start a new round for another source change; never replace captured historical source or reconstruct an old baseline using today's files.
+5. Respect the 25-file and 32-KiB source limits and credential screening. Resolve an oversized or unsafe selection before running. Partial/failed capture is not ready for a code-tracked round. Prompt/model-only comparisons still capture both file sets and show unchanged source explicitly.
+6. Verify baseline code is available before B exists, candidate code after B capture, and the saved comparison in Neatlogs. GitHub links require genuine repository/commit metadata; missing Git metadata must not hide saved local source.
+
 ## Run and improve
 
 Create an SDK evaluation task that invokes the actual agent with the chosen settings, retains conversation history and executes its own tools. Inspect `neatlogs evals run --help`; use supported dataset/version/case/trial/form/evaluator options. With an initialized TypeScript SDK, use `--trace-evidence` when supported. Explain other language/provider limitations rather than inventing evidence support.
