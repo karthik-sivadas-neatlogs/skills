@@ -10,7 +10,14 @@ Work in the user's agent project. The coding assistant runs the workflow; Neatlo
 ## Establish intent and connection
 
 - Use the user's goal, host and project. Ask one short question if the goal is missing. Never hardcode a cost, speed or quality target. Clarify an ambiguous measurement before claiming it was achieved.
-- Inspect installed CLI and SDK versions and `--help` before choosing commands. The API package is `neatlogs-cli`; the SDK's doctor executable is not a substitute. Verify the resolved executable, host, account and project. The API host is the dashboard origin, not the telemetry ingest endpoint.
+- Use `neatlogs-cli` 0.2.3 or a newer release that supports the required experiment commands. If the CLI is missing or older, check npm for the pinned release and install it.
+
+  ```sh
+  npm view neatlogs-cli@0.2.3 version && npm install --global neatlogs-cli@0.2.3
+  ```
+
+  If npm has not published the pinned release, report that blocker before starting an experiment. Verify the resolved executable with `command -v neatlogs` and `neatlogs --version`, then check its command help.
+- Inspect the installed SDK version and verify the host, account and project separately. Use the dashboard origin as the API host. Proceed once that host supports the required experiment operations.
 - Read `neatlogs --help`, `neatlogs local --help`, `neatlogs experiments --help`, `neatlogs datasets --help`, `neatlogs evals --help`, `neatlogs evaluators --help` and `neatlogs detections --help` as needed. Use installed command schemas for request bodies. If a required command is missing, identify the installed version and required capability; do not invent syntax.
 - Use existing authorized credentials without printing or committing them. Request browser approval when device sign-in requires it. Do not broaden scopes silently.
 - Start `neatlogs local connect` in a separate terminal and keep it alive during testing. A heartbeat confirms CLI availability, not agent execution. Only an actual saved agent trace confirms capture.
@@ -71,6 +78,19 @@ Inspect `neatlogs experiments record --help` and `neatlogs experiments round --h
 - `kind: "preparation"`: send `roundId`, `variant` (`A` or `B`) and `preparation` containing `state` (`preparing`, `ready` or `failed`), a brief `message` and the real `git` branch/sha when available. Mark ready only after preparing the actual agent code and settings. Each round has stable identities `(roundId, A)` and `(roundId, B)`.
 
 A changed dataset, check configuration or hypothesis requires a new setup/round; never mutate the setup frozen into earlier rounds. This tracking adds no human approval step in the Neatlogs UI.
+
+## Capture source before running
+
+Source tracking is the default for new A/B rounds. Inspect `neatlogs experiments record --help` for `--source-file` before running.
+
+Before capturing either variant, tell the user which files you selected and that `--source-file` uploads and durably stores the full contents in the verified Neatlogs project. Proceed when the user's authorization covers the selected files and destination. Otherwise, confirm the upload before running the command. If the user chooses a comparison without uploading source, use `neatlogs experiments round --data-only` and record that choice.
+
+1. Identify the relevant agent source, prompt and tool files. Select explicit relative paths, not the entire repository. Exclude credentials, binary files and unrelated data. Capture A before editing any of those files.
+2. Send the normal `kind: "preparation"` checkpoint JSON on stdin to `neatlogs experiments record --experiment <id> --body-stdin --source-file path/to/agent.py path/to/prompt.txt`. Replace the paths with the actual selected files. The CLI saves their immutable contents and digest; a checksum in the message is not a source snapshot.
+3. Run A from that exact source before making candidate changes. After editing, capture B with the same selected paths and variant B. Include paths absent in either version so additions and deletions are represented. Local/non-Git folders are supported. Clean matching Git revisions receive real commit, branch and canonical repository metadata automatically. Do not invent Git identity for uncommitted code.
+4. Re-submit each variant's preparation with the same file selection immediately before every run or retry. A changed saved version is rejected. Start a new round for another source change; never replace captured historical source or reconstruct an old baseline using today's files.
+5. Respect the 25-file and 32-KiB source limits and credential screening. Resolve an oversized or unsafe selection before running. Partial/failed capture is not ready for a code-tracked round. Prompt/model-only comparisons still capture both file sets and show unchanged source explicitly.
+6. Verify baseline code is available before B exists, candidate code after B capture, and the saved comparison in Neatlogs. GitHub links require genuine repository/commit metadata; missing Git metadata must not hide saved local source.
 
 ## Run and improve
 
