@@ -497,10 +497,10 @@ To make real workflow traces accurate for automated evaluation and step-by-step 
 - **Real-Trace Readiness Audit:** After exercising one real workflow, obtain explicit user approval to audit the captured trace through the installed SDK:
 
 ```bash
-python -m neatlogs trace audit <trace_id> --expect-session --expect-retriever --json
+python -m neatlogs doctor --trace <trace_id> --expect-session --expect-retriever --json
 ```
 
-(Or offline against a saved trace JSON via `python -m neatlogs trace audit --file trace.json --json`.)
+(Or offline against a saved trace JSON via `python -m neatlogs doctor --file trace.json --json`.)
 
 ---
 

@@ -164,7 +164,7 @@ After local Doctor passes and the requested instrumentation is in place:
    clean non-empty input/output, has the expected semantic hierarchy (including
    retrievers/tools and stable `session_id` when applicable), and contains no
    duplicate operation spans. When the installed SDK supports it, you may also
-   obtain approval to run `python -m neatlogs trace audit <trace_id> --json`
+   obtain approval to run `python -m neatlogs doctor --trace <trace_id> --json`
    (or `--file <trace.json> --json`) to check real-trace evaluation and replay
    readiness.
 

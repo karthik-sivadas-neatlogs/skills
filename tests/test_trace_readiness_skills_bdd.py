@@ -57,7 +57,7 @@ def test_bdd_setup_skill_encodes_judge_and_backtrack_readiness_rules() -> None:
     """Given a developer following neatlogs-py-setup,
     When reading SKILL.md and its references,
     Then root I/O, retriever freshness, session hygiene, provenance, replay=True,
-    and python -m neatlogs trace audit are all explicitly specified and linked."""
+    and python -m neatlogs doctor --trace are all explicitly specified and linked."""
     setup_dir = ROOT / "skills" / "neatlogs-py-setup"
     skill_md = (setup_dir / "SKILL.md").read_text(encoding="utf-8")
     understand = (setup_dir / "references" / "understand-first.md").read_text(encoding="utf-8")
@@ -70,8 +70,8 @@ def test_bdd_setup_skill_encodes_judge_and_backtrack_readiness_rules() -> None:
 
     # Then: Step 6b is wired into SKILL.md and all local links resolve cleanly
     assert "references/6b-retrievers-and-provenance.md" in skill_md
-    assert "python -m neatlogs trace audit" in skill_md
-    assert "python -m neatlogs trace audit" in py_skill
+    assert "python -m neatlogs doctor --trace" in skill_md
+    assert "python -m neatlogs doctor --trace" in py_skill
     assert "never pass `trace_id`" in skill_md.lower() or "never pass `trace_id`" in step_6b.lower()
     assert "per-request `neatlogs.flush()`" in skill_md
 
