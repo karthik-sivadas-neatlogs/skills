@@ -160,13 +160,16 @@ After local Doctor passes and the requested instrumentation is in place:
 3. Exercise one representative real user workflow. End every opened span and
    use the documented flush/shutdown lifecycle for that process type.
 4. Through the target project's normal product trace view or supported public
-   read path, verify that exact run is finalized, has one meaningful root with
-   clean non-empty input/output, has the expected semantic hierarchy (including
-   retrievers/tools and stable `session_id` when applicable), and contains no
-   duplicate operation spans. When the installed SDK supports it, you may also
-   obtain approval to run `python -m neatlogs doctor --trace <trace_id> --json`
-   (or `--file <trace.json> --json`) to check real-trace evaluation and replay
-   readiness.
+   read path, verify that exact run is finalized, has one meaningful root (and
+   in the product trace view, clean non-empty input/output; note that the public
+   CLI span list returns metadata only), has the expected semantic hierarchy
+   (including retrievers/tools and stable `session_id` when applicable), and
+   contains no duplicate operation spans. When `neatlogs >= 1.5.0` is installed
+   (check `python -c "import neatlogs; print(neatlogs.__version__)"` first;
+   older `v1.4.x` exits 4), you may also obtain approval to run
+   `python -m neatlogs doctor --trace <trace_id> --json` (using
+   `NEATLOGS_API_KEY` for full payload checks, or `--file <trace.json> --json`
+   offline) to check real-trace evaluation and replay readiness.
 
 Keep project credentials in the process environment or client secret storage;
 never put them in commands, output, files, or agent context. Do not use a

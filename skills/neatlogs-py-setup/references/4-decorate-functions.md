@@ -97,6 +97,7 @@ For each function, answer in order:
                kind="WORKFLOW",
                session_id=req.conversation_id,
                end_user_id=req.user_id,
+               # Requires neatlogs >= 1.5.0 (omit prompt_version on v1.4.x)
                prompt_version="chat-v2",
            ) as span:
                span.set_attribute("input.value", json.dumps({"message": req.message}))
@@ -111,7 +112,7 @@ For each function, answer in order:
 
 Automated evaluators and step-by-step replay read the `WORKFLOW` root span first:
 - **Non-empty root `input` and `output`:** Ensure the `WORKFLOW` entry point receives the user request and returns the final answer (or explicitly calls `span.set_attribute("input.value", ...)` / `span.set_attribute("output.value", ...)` for streaming handlers or functions that return `None`).
-- **Prompt & checkpoint provenance:** Pass `prompt_version="..."` on versioned `WORKFLOW` roots, and use `checkpoint_id="..."` (or `neatlogs.checkpoint(...)`) on multi-step loops so traces can be backtracked cleanly. See [`6b-retrievers-and-provenance.md`](6b-retrievers-and-provenance.md).
+- **Prompt & checkpoint provenance (`neatlogs >= 1.5.0`):** Check installed SDK version first (`python -c "import neatlogs; print(neatlogs.__version__)"`). On `neatlogs >= 1.5.0`, pass `prompt_version="..."` on versioned `WORKFLOW` roots and use `checkpoint_id="..."` (or `neatlogs.checkpoint(...)`) on multi-step loops so traces can be backtracked cleanly (omit on `v1.4.x` to avoid `TypeError`/`AttributeError`). See [`6b-retrievers-and-provenance.md`](6b-retrievers-and-provenance.md).
 
 2. **Does it contain a direct LLM API call?** (client.chat.completions.create, etc.)
    → YES → `@span(kind="CHAIN")` (see Step 5 for trace() wrapper)

@@ -88,7 +88,7 @@ def calculate(expression: str) -> str:
 
 ## Enabling Step Backtracking with `replay=True`
 
-For standalone tools with JSON-serializable inputs and outputs, pass `replay=True` so recorded traces can be backtracked, replayed, or forked from any step without re-executing live side effects. For custom retrievers, rerankers, memory lookups, and guardrails, continue to [`6b-retrievers-and-provenance.md`](6b-retrievers-and-provenance.md).
+For standalone, non-generator tools with deterministic JSON-serializable inputs and outputs, pass `replay=True` so recorded traces can be backtracked, replayed, or forked from any step without re-executing live side effects (do **not** pass `replay=True` on generator or async-generator functions, which raise `ReplayError` at decoration time). For custom retrievers, rerankers, memory lookups, and guardrails (where `replay=True` requires `neatlogs >= 1.5.0`), continue to [`6b-retrievers-and-provenance.md`](6b-retrievers-and-provenance.md).
 
 ## Verification
 

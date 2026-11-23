@@ -113,9 +113,20 @@ def test_bdd_setup_skill_encodes_judge_and_backtrack_readiness_rules() -> None:
         "NEATLOGS_ENVIRONMENT",
         "NEATLOGS_RELEASE",
         "neatlogs.checkpoint",
-        "neatlogs.report_diagnostic",
+        "neatlogs.report_diagnostic(category",
+        "neatlogs >= 1.5.0",
     ):
         assert expected in py_skill
+
+    # Guard against wrong report_diagnostic(kind=...) signature and invalid severity="warn"
+    assert "report_diagnostic(kind" not in py_skill
+    assert "report_diagnostic(kind" not in step_6b
+    assert 'severity="warn"' not in step_6b
+    assert 'severity="warning"' in step_6b
+
+    # Explicit >= 1.5.0 version prerequisite guard wherever PR #290 APIs are documented
+    for gated_doc in (skill_md, decorate_fns, decorate_tools, step_6b, py_skill, understand):
+        assert ">= 1.5.0" in gated_doc
 
     # Every relative markdown link in modified reference files resolves on disk
     for md_file in (
