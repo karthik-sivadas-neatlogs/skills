@@ -99,8 +99,11 @@ For each function, answer in order:
    MAX_DECODE_BYTES = MAX_PREVIEW_CHARS * 4  # cap raw bytes decoded across the stream
    ALLOWED_SSE_EVENTS = frozenset({"message", "delta", "text", "content"})
    _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
-   _BEARER_RE = re.compile(r"(?i)\b(?:authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]{8,}")
+   _BEARER_RE = re.compile(r"(?i)\b(?:authorization\s*:\s*)?bearer\s+\S+")
    _API_KEY_RE = re.compile(r"\b(?:sk|pk|nl[a-z]{0,2})[-_][A-Za-z0-9_-]{12,}\b")
+   _TRAILING_EMAIL_FRAG_RE = re.compile(r"\S*@\S*$")
+   _TRAILING_KEY_FRAG_RE = re.compile(r"\b(?:sk|pk|nl[a-z]{0,2})[-_]\S*$")
+   _LINE_END_RE = re.compile(r"\r\n|\r|\n")
 
 
    def _redact_pii(text: str) -> str:
@@ -112,9 +115,15 @@ For each function, answer in order:
 
    def _sanitize_and_bound(text: str, *, already_truncated: bool = False) -> tuple[str, bool]:
        exceeded = already_truncated or len(text) > MAX_SANITIZE_CHARS
-       sanitized = _redact_pii(text[:MAX_SANITIZE_CHARS])
+       window = text[:MAX_SANITIZE_CHARS]
+       if exceeded:
+           # Guard incomplete email/key fragments cut at the lookahead or collector boundary
+           window = _TRAILING_EMAIL_FRAG_RE.sub("[REDACTED_EMAIL]", window)
+           window = _TRAILING_KEY_FRAG_RE.sub("[REDACTED_SECRET]", window)
+       sanitized = _redact_pii(window)
        if len(sanitized) > MAX_PREVIEW_CHARS:
-           return sanitized[:MAX_PREVIEW_CHARS], True
+           clipped = _TRAILING_EMAIL_FRAG_RE.sub("", sanitized[:MAX_PREVIEW_CHARS])
+           return clipped, True
        return sanitized, exceeded
 
 
@@ -127,9 +136,12 @@ For each function, answer in order:
 
 
    def _extract_approved_dict_text(obj: dict) -> str:
-       inner_type = obj.get("event") or obj.get("type")
-       if isinstance(inner_type, str) and inner_type not in ALLOWED_SSE_EVENTS:
-           return ""
+       # Every present event/type tag must be allowlisted (don't let event="message" mask type="debug")
+       for tag_key in ("event", "type"):
+           if tag_key in obj:
+               tag = obj[tag_key]
+               if not isinstance(tag, str) or tag not in ALLOWED_SSE_EVENTS:
+                   return ""
        for key in ("text", "delta", "content"):
            val = obj.get(key)
            if isinstance(val, str):
@@ -146,15 +158,16 @@ For each function, answer in order:
            return _extract_approved_dict_text(payload)
        if not isinstance(payload, str) or not payload or payload == "[DONE]":
            return ""
+       if len(payload) > MAX_DECODE_BYTES:
+           head = payload[:MAX_DECODE_BYTES].lstrip()
+           return "" if (not head or head.startswith(("{", "["))) else payload[:MAX_SANITIZE_CHARS]
        stripped = payload.strip()
        if stripped.startswith(("{", "[")):
-           if len(stripped) > MAX_DECODE_BYTES:
-               return ""
            try:
                parsed = json.loads(stripped)
            except ValueError:
-               # Never export truncated/unparsed JSON wire objects that may hold private metadata
-               return "" if stripped.startswith(("{", "[{")) else payload
+               # Never export truncated/unparsed JSON wire objects or arrays
+               return ""
            return _extract_approved_dict_text(parsed) if isinstance(parsed, dict) else ""
        return payload
 
@@ -174,6 +187,7 @@ For each function, answer in order:
            self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
            self._bytes_remaining = MAX_DECODE_BYTES
            self._chars_remaining = MAX_DECODE_BYTES
+           self._seen_text = False
            self._line_buf = ""
            self._event_type: str | None = None
            self._data_lines: list[str] = []
@@ -224,11 +238,20 @@ For each function, answer in order:
                    payload = payload[1:]
                self._data_lines.append(payload)
 
-       def _consume_text(self, text: str) -> None:
+       def _consume_text(self, text: str, *, final: bool = False) -> None:
+           if not self._seen_text and text:
+               self._seen_text = True
+               if text.startswith("\ufeff"):
+                   text = text[1:]
            self._line_buf += text
-           while "\n" in self._line_buf:
-               raw_line, self._line_buf = self._line_buf.split("\n", 1)
-               self._consume_line(raw_line.rstrip("\r"))
+           pos = 0
+           buf = self._line_buf
+           for match in _LINE_END_RE.finditer(buf):
+               if match.group(0) == "\r" and match.end() == len(buf) and not final:
+                   break  # wait for next chunk in case \r is split across \r\n
+               self._consume_line(buf[pos : match.start()])
+               pos = match.end()
+           self._line_buf = buf[pos:]
 
        def feed(self, chunk) -> None:
            if self.truncated:
@@ -236,19 +259,22 @@ For each function, answer in order:
            if isinstance(chunk, (bytes, bytearray, memoryview)):
                own_mv = None if isinstance(chunk, memoryview) else memoryview(chunk)
                mv = chunk if own_mv is None else own_mv
+               byte_mv = mv if (mv.ndim == 1 and mv.format == "B") else mv.cast("B")
                try:
-                   if len(mv) > self._bytes_remaining:
-                       with mv[: self._bytes_remaining] as head:
+                   if len(byte_mv) > self._bytes_remaining:
+                       with byte_mv[: self._bytes_remaining] as head:
                            decoded = self._decoder.decode(head, final=False)
                        self._bytes_remaining = 0
                        self._consume_text(decoded)
                        self.truncated = True
                        return
-                   self._bytes_remaining -= len(mv)
-                   decoded = self._decoder.decode(mv, final=False)
+                   self._bytes_remaining -= len(byte_mv)
+                   decoded = self._decoder.decode(byte_mv, final=False)
                    self._consume_text(decoded)
                    return
                finally:
+                   if byte_mv is not mv:
+                       byte_mv.release()
                    if own_mv is not None:
                        own_mv.release()
            if isinstance(chunk, str):
@@ -267,7 +293,12 @@ For each function, answer in order:
                if isinstance(event_type, str) and event_type in ALLOWED_SSE_EVENTS:
                    if "data" in chunk:
                        raw_data = chunk["data"]
-                       if isinstance(raw_data, str) and raw_data.lstrip().startswith(("{", "[")) and len(raw_data) > MAX_DECODE_BYTES:
+                       if isinstance(raw_data, str) and len(raw_data) > MAX_DECODE_BYTES:
+                           head = raw_data[:MAX_DECODE_BYTES].lstrip()
+                           if not head or head.startswith(("{", "[")):
+                               self.truncated = True
+                               return
+                           self._append_reply(raw_data[:MAX_SANITIZE_CHARS])
                            self.truncated = True
                            return
                        extracted = _extract_approved_payload_text(raw_data)
@@ -279,8 +310,7 @@ For each function, answer in order:
        def finish(self, *, completed: bool) -> str:
            if completed and not self.truncated:
                tail = self._decoder.decode(b"", final=True)
-               if tail:
-                   self._consume_text(tail)
+               self._consume_text(tail, final=True)
            sanitized, self.truncated = _sanitize_and_bound(
                "".join(self._parts),
                already_truncated=self.truncated,
@@ -289,7 +319,8 @@ For each function, answer in order:
 
 
    async def chat(req):
-       # event_gen(req) yields valid SSE-formatted str, bytes, bytearray, or memoryview frames
+       # event_gen(req) yields valid SSE-formatted str, bytes, or memoryview frames
+       # (convert upstream bytearray chunks with bytes(chunk) before yielding to StreamingResponse)
        async def traced_gen():
            collector = _SSEPreviewCollector()
            completed = False
@@ -340,7 +371,7 @@ For each function, answer in order:
    - **Export approved, sanitized application-level projections — never raw request text or raw wire payloads:** Project only allowlisted, bounded, PII-redacted application fields for `input.value` and dispatch SSE frames only on the blank-line terminator (per WHATWG SSE spec, so `event: debug` appearing after `data:` is still filtered). For JSON/dict `data:` payloads, extract only allowlisted assistant text fields (`text`, `delta`, `content`) rather than exporting full JSON or `metadata`. Sanitize emails, bearer tokens, and API keys *before* clipping to `MAX_PREVIEW_CHARS` (and re-bound after redaction so redaction expansion still respects the cap and sets `truncated`).
    - **Bound raw byte decoding & preserve split UTF-8:** Cap raw bytes (`bytes`, `bytearray`, or `memoryview`) sliced into `codecs.getincrementaldecoder("utf-8")(errors="replace")` *before* decoding (so a multi-megabyte byte chunk never allocates megabytes and multi-byte UTF-8 characters like `€` split across chunks decode cleanly).
    - **Fail-open telemetry capture & attribute writes:** Guard identity attribute lookups (`conversation_id`/`user_id`), input projection, preview extraction, and `span.set_attribute(...)` calls in `try: ... except Exception: pass` and leave yielded wire chunks untouched so capture/attribute failures or raising property getters can never disrupt or terminate the application stream.
-   - **Match the response class to your chunk type:** Starlette's `StreamingResponse` accepts only `str`/`bytes` chunks (passing raw `dict` frames raises `AttributeError`) and requires `media_type="text/event-stream"` for SSE. If your generator yields `dict` frames (e.g. `{"event": "message", "data": "..."}`), return `EventSourceResponse(traced_gen())` from `sse-starlette` instead or serialize them to SSE `str`/`bytes` frames.
+   - **Match the response class to your chunk type:** Starlette's `StreamingResponse` accepts only `str`, `bytes`, or `memoryview` chunks (passing raw `dict` or `bytearray` frames raises `AttributeError` — convert upstream `bytearray` chunks via `bytes(chunk)` before yielding) and requires `media_type="text/event-stream"` for SSE. If your generator yields `dict` frames (e.g. `{"event": "message", "data": "..."}`), return `EventSourceResponse(traced_gen())` from `sse-starlette` instead or serialize them to SSE `str`/`bytes` frames.
    - **Distinguish truncated and incomplete streams:** Track normal loop completion (`completed`), per-chunk capture errors (`capture_failed`), and preview truncation (`truncated`), emit `neatlogs.output_truncated` and `neatlogs.stream_incomplete`, and never record a cancelled, errored, or capture-failed partial prefix as a complete final `"reply"` (prefer recording the app's existing sanitized final assembled answer when available).
 
 ## Clean Root I/O & Provenance Contract

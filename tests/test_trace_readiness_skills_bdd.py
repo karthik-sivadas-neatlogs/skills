@@ -236,6 +236,7 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert 'media_type="text/event-stream"' in decorate_fns
     assert "EventSourceResponse" in decorate_fns
     assert "sse-starlette" in decorate_fns
+    assert "bytes(chunk)" in decorate_fns
     assert "leave yielded wire chunks untouched" in decorate_fns.lower()
 
     ns = _load_sse_recipe_namespace(decorate_fns)
@@ -248,23 +249,32 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
         message="Help alice@example.com",
     )
 
-    # 1. Event filtering (including event: AFTER data: per WHATWG SSE spec), JSON payload
-    # projection (excluding private metadata), PII/token redaction, split UTF-8 ('€'),
-    # invalid UTF-8 bytearray, and memoryview chunk support
+    # 1. Event filtering (including event: AFTER data: per WHATWG SSE spec), BOM + bare \r +
+    # split \r\n framing, JSON payload projection (both event+type tags, truncated arrays,
+    # excluding private metadata), short/long bearer tokens + PII redaction, split UTF-8 ('€'),
+    # invalid UTF-8 bytearray, and 1D/2D memoryview chunk support
     mut_chunk = bytearray(b"data:  bad-\xff-utf8\n\n")
     mv_chunk = memoryview(b"data:  mv-ok\n\n")
+    mv2d_chunk = memoryview(b"data:  2d-ok\n\n").cast("B", shape=(2, 7))
     wire_chunks = [
+        b"\xef\xbb\xbfdata: BOM \r\r",
+        b"data: crlf \r",
+        b"\n\r\n",
         b"event: debug\ndata: secret debug-user@example.com\n\n",
         b"data: internal-before-debug\nevent: debug\n\n",
         b": keepalive\n\n",
         b"event: meta\ndata: internal-state\n\n",
+        b'data: {"event": "message", "type": "debug", "text": "sneaky-dual-tag"}\n\n',
+        b'data: ["truncated-json-array-secret\n\n',
+        b'data: [1, 2, 3]\n\n',
         b'data: {"text": "Hello ", "metadata": {"email": "private@example.com", "secret": "xyz"}}\n\n',
         b'data: {"delta": {"content": "world "}, "metadata": {"trace": "internal"}}\n\n',
         b'data: {"type": "debug", "text": "hidden-json-debug"}\n\n',
         b"event: message\ndata: Total \xe2",
-        b"\x82\xac42 for bob@example.com with Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig and sk-proj-abc1234567890xyz\n\n",
+        b"\x82\xac42 for bob@example.com with Bearer abc and Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig and sk-proj-abc1234567890xyz\n\n",
         mut_chunk,
         mv_chunk,
+        mv2d_chunk,
         "data: [DONE]\n\n",
     ]
 
@@ -283,10 +293,12 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert yielded == wire_chunks
     for orig, out in zip(wire_chunks, yielded, strict=True):
         assert out is orig
-    # Confirm bytearray buffer is unlocked and caller's memoryview was NOT released
+    # Confirm bytearray buffer is unlocked and caller's 1D/2D memoryviews were NOT released
     mut_chunk.extend(b"")
     assert mv_chunk.tobytes() == b"data:  mv-ok\n\n"
+    assert mv2d_chunk.tobytes() == b"data:  2d-ok\n\n"
     mv_chunk.release()
+    mv2d_chunk.release()
 
     span = recorded_spans[-1]
     assert json.loads(span.attributes["input.value"]) == {
@@ -297,17 +309,20 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     output_payload = json.loads(span.attributes["output.value"])
     assert output_payload == {
         "reply": (
-            "Hello world Total €42 for [REDACTED_EMAIL] with [REDACTED_TOKEN] "
-            "and [REDACTED_SECRET] bad-\ufffd-utf8 mv-ok"
+            "BOM crlf Hello world Total €42 for [REDACTED_EMAIL] with [REDACTED_TOKEN] "
+            "and [REDACTED_TOKEN] and [REDACTED_SECRET] bad-\ufffd-utf8 mv-ok 2d-ok"
         )
     }
     for forbidden in (
         "debug-user@example.com",
         "internal-before-debug",
+        "sneaky-dual-tag",
+        "truncated-json-array-secret",
         "bob@example.com",
         "private@example.com",
         "hidden-json-debug",
         "internal-state",
+        "Bearer abc",
         "eyJhbGciOiJIUzI1NiJ9",
         "sk-proj-abc1234567890xyz",
         "metadata",
@@ -327,8 +342,8 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert dict_collector.finish(completed=True) == "Hi [REDACTED_EMAIL]!"
     assert dict_collector.truncated is False
 
-    # 3. 8 MiB byte chunk must NOT allocate ~8 MiB during decode, must set truncated=True,
-    # and must NOT dispatch an un-terminated frame whose event: debug may follow at the end
+    # 3. 8 MiB byte chunk, 2 MiB 2D memoryview, and 2 MiB leading-space dict["data"] must all
+    # stay memory-bounded (<512 KiB peak) and never dispatch un-terminated debug frames
     big_chunk = b"data: " + b"x" * (8 * 1024 * 1024) + b"\nevent: debug\n\n"
     mem_collector = collector_cls()
     tracemalloc.start()
@@ -340,6 +355,30 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert peak < 512 * 1024, f"Expected bounded decode memory (<512 KiB), got {peak} bytes"
     assert mem_collector.truncated is True
     assert mem_collector.finish(completed=True) == ""
+
+    mv2d_big = memoryview(b"x" * (2 * 1024 * 1024)).cast("B", shape=(2, 1024 * 1024))
+    mv2d_collector = collector_cls()
+    tracemalloc.start()
+    try:
+        mv2d_collector.feed(mv2d_big)
+        _current, peak_2d = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    mv2d_big.release()
+    assert peak_2d < 512 * 1024, f"Expected bounded 2D memoryview decode (<512 KiB), got {peak_2d}"
+    assert mv2d_collector.truncated is True
+
+    huge_dict_str = " " + "{" + ("x" * (2 * 1024 * 1024)) + "}"
+    huge_dict_collector = collector_cls()
+    tracemalloc.start()
+    try:
+        huge_dict_collector.feed({"event": "message", "data": huge_dict_str})
+        _current, peak_dict = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak_dict < 512 * 1024, f"Expected bounded dict data check (<512 KiB), got {peak_dict}"
+    assert huge_dict_collector.truncated is True
+    assert huge_dict_collector.finish(completed=True) == ""
 
     # 4. Raising chunk properties/methods must NEVER disrupt the stream, AND capture failure
     # on a chunk (e.g. chunk B in A, B, C) must mark stream_incomplete=True + partial_reply
@@ -431,6 +470,30 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
         assert len(payload[field_key]) == 4096
         assert "alice" not in payload[field_key]
         assert "@example" not in payload[field_key]
+
+    # Boundary-cut email after bearer-token shrinkage (email crosses 8,192 MAX_SANITIZE_CHARS,
+    # while preceding 5,000-char bearer token shrinks so it falls inside 4,096 output cap)
+    shrink_msg = "Bearer " + ("x" * 5000) + " " + ("a" * 3176) + " alice@example.com"
+    assert len(shrink_msg) > 8192
+
+    async def _run_shrink_boundary_stream():
+        async def _event_gen(_req):
+            yield "data: " + shrink_msg + "\n\n"
+
+        ns["event_gen"] = _event_gen
+        resp = await chat_fn(
+            types.SimpleNamespace(conversation_id="c-s", user_id="u-s", message=shrink_msg)
+        )
+        return [item async for item in resp.body_iterator]
+
+    asyncio.run(_run_shrink_boundary_stream())
+    shrink_span = recorded_spans[-1]
+    for attr_key, field_key in (("input.value", "message"), ("output.value", "reply")):
+        payload = json.loads(shrink_span.attributes[attr_key])
+        assert payload["truncated"] is True
+        assert "alice" not in payload[field_key]
+        assert "@e" not in payload[field_key]
+        assert "[REDACTED_TOKEN]" in payload[field_key]
 
     # 4,095-char string full of short emails expands past 4,096 on redaction -> must re-bound & set truncated=True
     expanding_text = "a@b.co " * 585  # 4,095 chars -> 9,945 chars after redaction
