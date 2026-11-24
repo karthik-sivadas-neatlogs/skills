@@ -330,6 +330,7 @@ For each function, answer in order:
            collector = _SSEPreviewCollector()
            completed = False
            capture_failed = False
+           input_truncated = False
            with neatlogs.trace(
                "chat",
                kind="WORKFLOW",
@@ -339,7 +340,9 @@ For each function, answer in order:
                prompt_version="chat-v2",
            ) as span:
                try:
-                   span.set_attribute("input.value", json.dumps(_project_request_input(req)))
+                   input_projection = _project_request_input(req)
+                   input_truncated = bool(input_projection.get("truncated"))
+                   span.set_attribute("input.value", json.dumps(input_projection))
                except Exception:
                    pass  # input projection / attribute errors must never disrupt the stream
                try:
@@ -354,19 +357,14 @@ For each function, answer in order:
                    try:
                        preview = collector.finish(completed=completed)
                        stream_incomplete = (not completed) or capture_failed
+                       capture_truncated = input_truncated or collector.truncated
+                       span.set_attribute("neatlogs.capture.truncated", capture_truncated)
+                       span.set_attribute("neatlogs.stream.incomplete", stream_incomplete)
                        if not stream_incomplete:
-                           output_payload = {"reply": preview}
+                           output_payload: dict[str, object] = {"reply": preview}
                            if collector.truncated:
                                output_payload["truncated"] = True
-                       else:
-                           output_payload = {
-                               "partial_reply": preview,
-                               "incomplete": True,
-                               "truncated": collector.truncated,
-                           }
-                       span.set_attribute("neatlogs.output_truncated", collector.truncated)
-                       span.set_attribute("neatlogs.stream_incomplete", stream_incomplete)
-                       span.set_attribute("output.value", json.dumps(output_payload))
+                           span.set_attribute("output.value", json.dumps(output_payload))
                    except Exception:
                        pass
        return StreamingResponse(traced_gen(), media_type="text/event-stream")
@@ -377,7 +375,7 @@ For each function, answer in order:
    - **Bound raw byte decoding & preserve split UTF-8:** Cap raw bytes (`bytes`, `bytearray`, or `memoryview`) sliced into `codecs.getincrementaldecoder("utf-8")(errors="replace")` *before* decoding (so a multi-megabyte byte chunk never allocates megabytes and multi-byte UTF-8 characters like `€` split across chunks decode cleanly).
    - **Fail-open telemetry capture & attribute writes:** Guard identity attribute lookups (`conversation_id`/`user_id`), input projection, preview extraction, and `span.set_attribute(...)` calls in `try: ... except Exception: pass` and leave yielded wire chunks untouched so capture/attribute failures or raising property getters can never disrupt or terminate the application stream.
    - **Match the response class to your chunk type:** Starlette's `StreamingResponse` accepts only `str`, `bytes`, or `memoryview` chunks (passing raw `dict` or `bytearray` frames raises `AttributeError` — convert upstream `bytearray` chunks via `bytes(chunk)` before yielding) and requires `media_type="text/event-stream"` for SSE. If your generator yields `dict` frames (e.g. `{"event": "message", "data": "..."}`), return `EventSourceResponse(traced_gen())` from `sse-starlette` instead or serialize them to SSE `str`/`bytes` frames.
-   - **Distinguish truncated and incomplete streams:** Track normal loop completion (`completed`), per-chunk capture errors (`capture_failed`), and preview truncation (`truncated`), emit `neatlogs.output_truncated` and `neatlogs.stream_incomplete`, and never record a cancelled, errored, or capture-failed partial prefix as a complete final `"reply"` (prefer recording the app's existing sanitized final assembled answer when available).
+   - **Distinguish truncated and incomplete streams with canonical Doctor flags:** Track normal loop completion (`completed`), per-chunk capture errors (`capture_failed`), and input/preview truncation (`capture_truncated`), emit `neatlogs.capture.truncated` and `neatlogs.stream.incomplete`, and omit final root `output.value` completely whenever the stream is incomplete (cancelled, errored, or capture-failed) so `neatlogs doctor --trace` never counts a partial prefix as a final answer (prefer recording the app's existing sanitized final assembled answer when available).
 
 ## Clean Root I/O & Provenance Contract
 

@@ -229,9 +229,13 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
         ROOT / "skills" / "neatlogs-py-setup" / "references" / "4-decorate-functions.md"
     ).read_text(encoding="utf-8")
 
-    # Guard against unsafe patterns and verify required Starlette/SSE guidance
+    # Guard against unsafe patterns and non-canonical Doctor flag names
     assert "ev.text" not in decorate_fns
     assert 'getattr(chunk, "text"' not in decorate_fns
+    assert "neatlogs.output_truncated" not in decorate_fns
+    assert "neatlogs.stream_incomplete" not in decorate_fns
+    assert "neatlogs.capture.truncated" in decorate_fns
+    assert "neatlogs.stream.incomplete" in decorate_fns
     assert "MAX_PREVIEW_CHARS = 4096" in decorate_fns
     assert 'media_type="text/event-stream"' in decorate_fns
     assert "EventSourceResponse" in decorate_fns
@@ -304,8 +308,8 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert json.loads(span.attributes["input.value"]) == {
         "message": "Help [REDACTED_EMAIL]"
     }
-    assert span.attributes["neatlogs.output_truncated"] is False
-    assert span.attributes["neatlogs.stream_incomplete"] is False
+    assert span.attributes["neatlogs.capture.truncated"] is False
+    assert span.attributes["neatlogs.stream.incomplete"] is False
     output_payload = json.loads(span.attributes["output.value"])
     assert output_payload == {
         "reply": (
@@ -381,7 +385,7 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert huge_dict_collector.finish(completed=True) == ""
 
     # 4. Raising chunk properties/methods must NEVER disrupt the stream, AND capture failure
-    # on a chunk (e.g. chunk B in A, B, C) must mark stream_incomplete=True + partial_reply
+    # on a chunk (e.g. chunk B in A, B, C) must set neatlogs.stream.incomplete=True and omit output.value
     class _HostileEvent:
         @property
         def text(self) -> str:
@@ -404,9 +408,9 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     unknown_out = asyncio.run(_run_unknown_obj_stream())
     assert len(unknown_out) == 2
     assert json.loads(recorded_spans[-1].attributes["output.value"]) == {"reply": "ok"}
-    assert recorded_spans[-1].attributes["neatlogs.stream_incomplete"] is False
+    assert recorded_spans[-1].attributes["neatlogs.stream.incomplete"] is False
 
-    # Chunk B raises during collector.feed -> A, B, C all yield untouched, but stream_incomplete=True
+    # Chunk B raises during collector.feed -> A, B, C all yield untouched, stream.incomplete=True, no output.value
     hostile_chunks = ["data: A\n\n", _HostileDict(), "data: C\n\n"]
 
     async def _run_hostile_stream():
@@ -423,14 +427,9 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     for orig, out in zip(hostile_chunks, hostile_out, strict=True):
         assert out is orig
     hostile_span = recorded_spans[-1]
-    assert hostile_span.attributes["neatlogs.stream_incomplete"] is True
-    hostile_payload = json.loads(hostile_span.attributes["output.value"])
-    assert "reply" not in hostile_payload
-    assert hostile_payload == {
-        "partial_reply": "AC",
-        "incomplete": True,
-        "truncated": False,
-    }
+    assert hostile_span.attributes["neatlogs.stream.incomplete"] is True
+    assert hostile_span.attributes["neatlogs.capture.truncated"] is False
+    assert "output.value" not in hostile_span.attributes
 
     # 5. Stream exceeding cap, boundary-crossing email, and post-redaction expansion cap
     async def _run_truncated_stream():
@@ -443,8 +442,8 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
 
     asyncio.run(_run_truncated_stream())
     trunc_span = recorded_spans[-1]
-    assert trunc_span.attributes["neatlogs.output_truncated"] is True
-    assert trunc_span.attributes["neatlogs.stream_incomplete"] is False
+    assert trunc_span.attributes["neatlogs.capture.truncated"] is True
+    assert trunc_span.attributes["neatlogs.stream.incomplete"] is False
     assert json.loads(trunc_span.attributes["output.value"]) == {
         "reply": "a" * 4096,
         "truncated": True,
@@ -511,7 +510,7 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
 
     asyncio.run(_run_expanding_stream())
     exp_span = recorded_spans[-1]
-    assert exp_span.attributes["neatlogs.output_truncated"] is True
+    assert exp_span.attributes["neatlogs.capture.truncated"] is True
     exp_in = json.loads(exp_span.attributes["input.value"])
     exp_out = json.loads(exp_span.attributes["output.value"])
     assert exp_in["truncated"] is True
@@ -521,7 +520,7 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert len(exp_out["reply"]) == 4096
     assert "a@b.co" not in exp_out["reply"]
 
-    # 6. Mid-stream error & early cancellation mark incomplete=True and avoid recording "reply"
+    # 6. Mid-stream error & early cancellation set neatlogs.stream.incomplete=True and omit output.value
     async def _run_errored_stream():
         async def _event_gen(_req):
             yield "data: partial\n\n"
@@ -541,15 +540,9 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert seen_before_err == ["data: partial\n\n"]
     assert err_msg == "upstream reset"
     err_span = recorded_spans[-1]
-    assert err_span.attributes["neatlogs.stream_incomplete"] is True
-    assert err_span.attributes["neatlogs.output_truncated"] is False
-    err_payload = json.loads(err_span.attributes["output.value"])
-    assert "reply" not in err_payload
-    assert err_payload == {
-        "partial_reply": "partial",
-        "incomplete": True,
-        "truncated": False,
-    }
+    assert err_span.attributes["neatlogs.stream.incomplete"] is True
+    assert err_span.attributes["neatlogs.capture.truncated"] is False
+    assert "output.value" not in err_span.attributes
 
     async def _run_cancelled_stream():
         async def _event_gen(_req):
@@ -564,11 +557,9 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
 
     assert asyncio.run(_run_cancelled_stream()) == "data: first\n\n"
     cancel_span = recorded_spans[-1]
-    assert cancel_span.attributes["neatlogs.stream_incomplete"] is True
-    cancel_payload = json.loads(cancel_span.attributes["output.value"])
-    assert "reply" not in cancel_payload
-    assert cancel_payload["partial_reply"] == "first"
-    assert cancel_payload["incomplete"] is True
+    assert cancel_span.attributes["neatlogs.stream.incomplete"] is True
+    assert cancel_span.attributes["neatlogs.capture.truncated"] is False
+    assert "output.value" not in cancel_span.attributes
 
     # 7. Actual generator survives raising identity/message getters, capture failure, AND span.set_attribute failure
     class _FailingSpan:
@@ -639,6 +630,8 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
 
     asyncio.run(_run_long_input_stream())
     long_input_span = recorded_spans[-1]
+    assert long_input_span.attributes["neatlogs.capture.truncated"] is True
+    assert long_input_span.attributes["neatlogs.stream.incomplete"] is False
     input_payload = json.loads(long_input_span.attributes["input.value"])
     assert input_payload["truncated"] is True
     assert "secret@example.com" not in input_payload["message"]
@@ -646,6 +639,207 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert "[REDACTED_EMAIL]" in input_payload["message"]
     assert "[REDACTED_TOKEN]" in input_payload["message"]
     assert len(input_payload["message"]) <= 4096
+
+
+def _audit_sse_trace_with_doctor(
+    trace: dict[str, object], spans: list[dict[str, object]]
+) -> dict[str, object]:
+    """Run paired neatlogs.trace_audit.audit_trace when installed, else enforce its canonical contract."""
+    try:
+        from neatlogs.trace_audit import audit_trace  # type: ignore[import-not-found]
+    except ImportError:
+        audit_trace = None
+
+    if audit_trace is not None:
+        return audit_trace(trace, spans)
+
+    # Standalone skills CI contract mirror of SDK #290 neatlogs/trace_audit.py canonical rules
+    canonical_incomplete_flags = (
+        "pii.server_redacted",
+        "pii.server_redaction_failed",
+        "neatlogs.payload.truncated",
+        "neatlogs.capture.truncated",
+        "neatlogs.stream.incomplete",
+    )
+    root = spans[0]
+    attrs = root["attributes"]
+    assert isinstance(attrs, dict)
+
+    def _non_empty(val: object) -> bool:
+        if val is None:
+            return False
+        if isinstance(val, str):
+            s = val.strip()
+            return bool(s) and s not in {'""', "null", "None", "{}", "[]"}
+        return True
+
+    root_io_ok = _non_empty(attrs.get("input.value")) and _non_empty(attrs.get("output.value"))
+    lossy = any(attrs.get(k) is True or attrs.get(k) == "true" for k in canonical_incomplete_flags)
+    checks = [
+        {"name": "root_io_present", "status": "pass" if root_io_ok else "fail"},
+        {"name": "provenance_and_replayability", "status": "fail" if lossy else "pass"},
+    ]
+    return {
+        "jev_ready": root_io_ok,
+        "replay_ready": not lossy,
+        "checks": checks,
+    }
+
+
+def test_bdd_sse_recipe_traces_match_paired_doctor_readiness_rules() -> None:
+    """Given real traces produced by the SSE streaming recipe in 4-decorate-functions.md,
+    When evaluated with the paired Doctor audit rules across complete, truncated,
+    errored, cancelled, and capture-failed runs,
+    Then complete runs are judge- and replay-ready, truncated runs are flagged non-replay-ready
+    via neatlogs.capture.truncated, and incomplete runs omit output.value and fail both
+    root_io_present (jev_ready=False) and provenance_and_replayability (replay_ready=False)."""
+    decorate_fns = (
+        ROOT / "skills" / "neatlogs-py-setup" / "references" / "4-decorate-functions.md"
+    ).read_text(encoding="utf-8")
+    ns = _load_sse_recipe_namespace(decorate_fns)
+    chat_fn = ns["chat"]
+    recorded_spans = ns["_recorded_spans"]
+    req = types.SimpleNamespace(
+        conversation_id="conv-doctor",
+        user_id="user-doctor",
+        message="Explain SSE tracing",
+    )
+
+    def _audit_latest_span(trace_id: str) -> tuple[dict[str, object], dict[str, str]]:
+        attrs = dict(recorded_spans[-1].attributes)
+        attrs.setdefault("neatlogs.prompt.version", "chat-v2")
+        attrs.setdefault("neatlogs.step.seq", 1)
+        attrs.setdefault("neatlogs.session.id", "conv-doctor")
+        trace = {
+            "trace_id": trace_id,
+            "finalizationStatus": "finalized",
+            "session_id": "conv-doctor",
+        }
+        spans = [
+            {
+                "span_id": "span-root-1",
+                "parent_span_id": None,
+                "name": "chat",
+                "span_type": "WORKFLOW",
+                "attributes": attrs,
+            },
+            {
+                "span_id": "span-tool-1",
+                "parent_span_id": "span-root-1",
+                "name": "lookup_docs",
+                "span_type": "TOOL",
+                "attributes": {
+                    "neatlogs.span.kind": "TOOL",
+                    "neatlogs.tool.name": "lookup_docs",
+                    "neatlogs.step.seq": 2,
+                    "input.value": '{"query": "SSE tracing"}',
+                    "output.value": '{"docs": ["doc-1"]}',
+                },
+            },
+        ]
+        result = _audit_sse_trace_with_doctor(trace, spans)
+        check_map = {c["name"]: c["status"] for c in result["checks"]}
+        return result, check_map
+
+    # 1. Complete, non-truncated stream -> jev_ready=True and replay_ready=True
+    async def _run_clean():
+        async def _event_gen(_req):
+            yield "data: Complete answer\n\n"
+
+        ns["event_gen"] = _event_gen
+        resp = await chat_fn(req)
+        return [item async for item in resp.body_iterator]
+
+    asyncio.run(_run_clean())
+    clean_res, clean_checks = _audit_latest_span("trace-clean")
+    assert clean_checks["root_io_present"] == "pass"
+    assert clean_checks["provenance_and_replayability"] == "pass"
+    assert clean_res["jev_ready"] is True
+    assert clean_res["replay_ready"] is True
+
+    # 2. Truncated output stream -> neatlogs.capture.truncated=True -> replay_ready=False
+    async def _run_truncated():
+        async def _event_gen(_req):
+            yield "data: " + ("x" * 5000) + "\n\n"
+
+        ns["event_gen"] = _event_gen
+        resp = await chat_fn(req)
+        return [item async for item in resp.body_iterator]
+
+    asyncio.run(_run_truncated())
+    trunc_res, trunc_checks = _audit_latest_span("trace-truncated")
+    assert recorded_spans[-1].attributes["neatlogs.capture.truncated"] is True
+    assert recorded_spans[-1].attributes["neatlogs.stream.incomplete"] is False
+    assert trunc_checks["root_io_present"] == "pass"
+    assert trunc_checks["provenance_and_replayability"] == "fail"
+    assert trunc_res["replay_ready"] is False
+
+    # 3. Mid-stream error -> output.value omitted + neatlogs.stream.incomplete=True -> jev_ready=False, replay_ready=False
+    async def _run_errored():
+        async def _event_gen(_req):
+            yield "data: partial before crash\n\n"
+            raise RuntimeError("boom")
+
+        ns["event_gen"] = _event_gen
+        resp = await chat_fn(req)
+        try:
+            async for _item in resp.body_iterator:
+                pass
+        except RuntimeError:
+            pass
+
+    asyncio.run(_run_errored())
+    err_res, err_checks = _audit_latest_span("trace-errored")
+    assert "output.value" not in recorded_spans[-1].attributes
+    assert recorded_spans[-1].attributes["neatlogs.stream.incomplete"] is True
+    assert err_checks["root_io_present"] == "fail"
+    assert err_checks["provenance_and_replayability"] == "fail"
+    assert err_res["jev_ready"] is False
+    assert err_res["replay_ready"] is False
+
+    # 4. Early cancellation -> output.value omitted + neatlogs.stream.incomplete=True -> jev_ready=False, replay_ready=False
+    async def _run_cancelled():
+        async def _event_gen(_req):
+            yield "data: first chunk\n\n"
+            yield "data: second chunk\n\n"
+
+        ns["event_gen"] = _event_gen
+        resp = await chat_fn(req)
+        await resp.body_iterator.__anext__()
+        await resp.body_iterator.aclose()
+
+    asyncio.run(_run_cancelled())
+    cancel_res, cancel_checks = _audit_latest_span("trace-cancelled")
+    assert "output.value" not in recorded_spans[-1].attributes
+    assert recorded_spans[-1].attributes["neatlogs.stream.incomplete"] is True
+    assert cancel_checks["root_io_present"] == "fail"
+    assert cancel_checks["provenance_and_replayability"] == "fail"
+    assert cancel_res["jev_ready"] is False
+    assert cancel_res["replay_ready"] is False
+
+    # 5. Per-chunk capture failure -> output.value omitted + neatlogs.stream.incomplete=True -> jev_ready=False, replay_ready=False
+    class _BrokenDict(dict):
+        def get(self, *_args, **_kwargs):
+            raise RuntimeError("broken")
+
+    async def _run_capture_failed():
+        async def _event_gen(_req):
+            yield "data: A\n\n"
+            yield _BrokenDict()
+            yield "data: C\n\n"
+
+        ns["event_gen"] = _event_gen
+        resp = await chat_fn(req)
+        return [item async for item in resp.body_iterator]
+
+    asyncio.run(_run_capture_failed())
+    cap_res, cap_checks = _audit_latest_span("trace-capture-failed")
+    assert "output.value" not in recorded_spans[-1].attributes
+    assert recorded_spans[-1].attributes["neatlogs.stream.incomplete"] is True
+    assert cap_checks["root_io_present"] == "fail"
+    assert cap_checks["provenance_and_replayability"] == "fail"
+    assert cap_res["jev_ready"] is False
+    assert cap_res["replay_ready"] is False
 
 
 def test_bdd_checkpoint_docs_do_not_promise_automatic_scrubbing() -> None:
