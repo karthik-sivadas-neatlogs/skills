@@ -101,7 +101,7 @@ For each function, answer in order:
    _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
    _BEARER_RE = re.compile(r"(?i)\b(?:authorization\s*:\s*)?bearer\s+\S+")
    _API_KEY_RE = re.compile(r"\b(?:sk|pk|nl[a-z]{0,2})[-_][A-Za-z0-9_-]{12,}\b")
-   _TRAILING_EMAIL_FRAG_RE = re.compile(r"\S*@\S*$")
+   _TRAILING_EMAIL_FRAG_RE = re.compile(r"(?:^|(?<=\s))\S*@\S*$")
    _TRAILING_KEY_FRAG_RE = re.compile(r"\b(?:sk|pk|nl[a-z]{0,2})[-_]\S*$")
    _LINE_END_RE = re.compile(r"\r\n|\r|\n")
 
@@ -147,6 +147,11 @@ For each function, answer in order:
            if isinstance(val, str):
                return val
            if key == "delta" and isinstance(val, dict):
+               for tag_key in ("event", "type"):
+                   if tag_key in val:
+                       tag = val[tag_key]
+                       if not isinstance(tag, str) or tag not in ALLOWED_SSE_EVENTS:
+                           return ""
                nested = val.get("text") or val.get("content")
                if isinstance(nested, str):
                    return nested
