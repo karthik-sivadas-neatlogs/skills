@@ -86,26 +86,143 @@ For each function, answer in order:
    # ❌ WRONG — decorator closes when the StreamingResponse is returned, orphaning the stream
    @neatlogs.span(kind="WORKFLOW", name="chat")
    async def chat(...):
-       return StreamingResponse(event_gen())
+       return StreamingResponse(event_gen(), media_type="text/event-stream")
 
    # ✅ RIGHT — span lives inside the generator, stays open across all yields → one trace
-   MAX_PREVIEW_CHARS = 4096
+   import codecs
+   import json
+   import re
+   from starlette.responses import StreamingResponse
 
-   def _preview_text(chunk) -> str:
-       if isinstance(chunk, str):
-           return chunk
-       if isinstance(chunk, (bytes, bytearray)):
-           return chunk.decode("utf-8", errors="replace")
-       if isinstance(chunk, dict):
-           val = chunk.get("text") or chunk.get("content") or chunk.get("data")
-           return val if isinstance(val, str) else ""
-       val = getattr(chunk, "text", None)
-       return val if isinstance(val, str) else ""
+   MAX_PREVIEW_CHARS = 4096
+   MAX_DECODE_BYTES = MAX_PREVIEW_CHARS * 4  # cap raw bytes decoded across the stream
+   ALLOWED_SSE_EVENTS = frozenset({"message", "delta", "text", "content"})
+   _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+
+
+   def _redact_pii(text: str) -> str:
+       # Substitute your app's PII/secret scrubber (or configure neatlogs.init(mask=...))
+       return _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+
+
+   def _project_request_input(req) -> dict[str, object]:
+       # Export an approved, sanitized application-level projection — never raw request bodies
+       raw_message = getattr(req, "message", "")
+       text = raw_message if isinstance(raw_message, str) else ""
+       truncated = len(text) > MAX_PREVIEW_CHARS
+       projection: dict[str, object] = {
+           "message": _redact_pii(text[:MAX_PREVIEW_CHARS]),
+       }
+       if truncated:
+           projection["truncated"] = True
+       return projection
+
+
+   class _SSEPreviewCollector:
+       def __init__(self) -> None:
+           self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+           self._bytes_remaining = MAX_DECODE_BYTES
+           self._chars_remaining = MAX_DECODE_BYTES
+           self._line_buf = ""
+           self._event_type = "message"
+           self._parts: list[str] = []
+           self._preview_len = 0
+           self.truncated = False
+
+       def _append_reply(self, text: str) -> None:
+           if not text:
+               return
+           remaining = MAX_PREVIEW_CHARS - self._preview_len
+           if remaining <= 0:
+               self.truncated = True
+               return
+           if len(text) > remaining:
+               self._parts.append(text[:remaining])
+               self._preview_len = MAX_PREVIEW_CHARS
+               self.truncated = True
+           else:
+               self._parts.append(text)
+               self._preview_len += len(text)
+
+       def _consume_line(self, line: str) -> None:
+           if line == "":
+               self._event_type = "message"
+               return
+           if line.startswith(":"):
+               return  # SSE comment / keepalive
+           if line.startswith("event:"):
+               self._event_type = line[6:].strip() or "message"
+               return
+           # Only capture user-facing assistant text/content events; skip debug/meta frames
+           if line.startswith("data:") and self._event_type in ALLOWED_SSE_EVENTS:
+               payload = line[5:]
+               if payload.startswith(" "):
+                   payload = payload[1:]
+               if payload and payload != "[DONE]":
+                   self._append_reply(payload)
+
+       def _consume_text(self, text: str) -> None:
+           self._line_buf += text
+           while "\n" in self._line_buf:
+               raw_line, self._line_buf = self._line_buf.split("\n", 1)
+               self._consume_line(raw_line.rstrip("\r"))
+
+       def _flush_partial_line(self) -> None:
+           if self._line_buf:
+               self._consume_line(self._line_buf.rstrip("\r"))
+               self._line_buf = ""
+
+       def feed(self, chunk) -> None:
+           if self.truncated:
+               return
+           if isinstance(chunk, (bytes, bytearray)):
+               if len(chunk) > self._bytes_remaining:
+                   with memoryview(chunk) as mv:
+                       decoded = self._decoder.decode(mv[: self._bytes_remaining], final=False)
+                   self._bytes_remaining = 0
+                   self._consume_text(decoded)
+                   self._flush_partial_line()
+                   self.truncated = True
+                   return
+               self._bytes_remaining -= len(chunk)
+               with memoryview(chunk) as mv:
+                   decoded = self._decoder.decode(mv, final=False)
+               self._consume_text(decoded)
+               return
+           if isinstance(chunk, str):
+               if len(chunk) > self._chars_remaining:
+                   sliced = chunk[: self._chars_remaining]
+                   self._chars_remaining = 0
+                   self._consume_text(sliced)
+                   self._flush_partial_line()
+                   self.truncated = True
+                   return
+               self._chars_remaining -= len(chunk)
+               self._consume_text(chunk)
+               return
+           # For sse-starlette EventSourceResponse dict frames (never pass raw dicts to StreamingResponse)
+           if isinstance(chunk, dict):
+               event_type = chunk.get("event", "message")
+               if isinstance(event_type, str) and event_type in ALLOWED_SSE_EVENTS:
+                   val = chunk.get("data")
+                   if isinstance(val, str) and val != "[DONE]":
+                       self._append_reply(val)
+
+       def finish(self, *, completed: bool) -> str:
+           if not self.truncated:
+               if completed:
+                   tail = self._decoder.decode(b"", final=True)
+                   if tail:
+                       self._consume_text(tail)
+               self._flush_partial_line()
+           return _redact_pii("".join(self._parts))
+
 
    async def chat(req):
+       # event_gen(req) yields valid SSE-formatted str or bytes frames
        async def traced_gen():
-           preview_parts: list[str] = []
-           preview_len = 0
+           collector = _SSEPreviewCollector()
+           completed = False
            with neatlogs.trace(
                "chat",
                kind="WORKFLOW",
@@ -114,27 +231,45 @@ For each function, answer in order:
                # Requires neatlogs >= 1.5.0 (omit prompt_version on v1.4.x)
                prompt_version="chat-v2",
            ) as span:
-               span.set_attribute("input.value", json.dumps({"message": req.message}))
+               try:
+                   span.set_attribute("input.value", json.dumps(_project_request_input(req)))
+               except Exception:
+                   pass  # input projection / attribute errors must never disrupt the stream
                try:
                    async for ev in event_gen(req):
-                       if preview_len < MAX_PREVIEW_CHARS:
-                           piece = _preview_text(ev)
-                           if piece:
-                               take = piece[: MAX_PREVIEW_CHARS - preview_len]
-                               preview_parts.append(take)
-                               preview_len += len(take)
+                       try:
+                           collector.feed(ev)
+                       except Exception:
+                           pass  # telemetry extraction must never disrupt or terminate the stream
                        yield ev  # leave yielded wire chunks untouched
+                   completed = True
                finally:
-                   span.set_attribute(
-                       "output.value",
-                       json.dumps({"reply": "".join(preview_parts)}),
-                   )
-       return StreamingResponse(traced_gen())
+                   try:
+                       preview = collector.finish(completed=completed)
+                       if completed:
+                           output_payload = {"reply": preview}
+                           if collector.truncated:
+                               output_payload["truncated"] = True
+                       else:
+                           output_payload = {
+                               "partial_reply": preview,
+                               "incomplete": True,
+                               "truncated": collector.truncated,
+                           }
+                       span.set_attribute("neatlogs.output_truncated", collector.truncated)
+                       span.set_attribute("neatlogs.stream_incomplete", not completed)
+                       span.set_attribute("output.value", json.dumps(output_payload))
+                   except Exception:
+                       pass
+       return StreamingResponse(traced_gen(), media_type="text/event-stream")
    ```
 
-   Keep streaming instrumentation non-invasive and bounded:
-   - Never assume chunks are objects with `.text` — SSE generators commonly yield raw `str`, `bytes`, or `dict` frames; leave yielded wire chunks untouched and handle unknown chunk types without raising.
-   - Cap telemetry buffering to a bounded, sanitized preview (e.g., `MAX_PREVIEW_CHARS = 4096` / 4 KB), or prefer recording the app's existing final assembled answer (sanitized for PII if needed) so telemetry memory never grows unboundedly with stream length.
+   Keep streaming instrumentation non-invasive, sanitized, and bounded:
+   - **Export approved, sanitized application-level projections — never raw request text or raw wire payloads:** Project only allowlisted, bounded, PII-redacted application fields for `input.value` and extract preview text only from allowlisted user-facing assistant text/content events for `output.value` — never export raw request bodies, `event: debug`, internal/metadata SSE frames, keepalive comments, or raw wire frames verbatim. If `data:` lines carry JSON payloads, extract only the allowlisted assistant text field and run your PII/secret scrubber (or `neatlogs.init(mask=...)`) before recording attributes.
+   - **Bound raw byte decoding & preserve split UTF-8:** Cap raw bytes sliced into `codecs.getincrementaldecoder("utf-8")(errors="replace")` *before* decoding (so a multi-megabyte byte chunk never allocates megabytes and multi-byte UTF-8 characters like `€` split across chunks decode cleanly).
+   - **Fail-open telemetry capture & attribute writes:** Wrap all input projection, preview extraction, and `span.set_attribute(...)` calls in `try: ... except Exception: pass` and leave yielded wire chunks untouched so capture/attribute failures or raising property getters can never disrupt or terminate the application stream.
+   - **Match the response class to your chunk type:** Starlette's `StreamingResponse` accepts only `str`/`bytes` chunks (passing raw `dict` frames raises `AttributeError`) and requires `media_type="text/event-stream"` for SSE. If your generator yields `dict` frames (e.g. `{"event": "message", "data": "..."}`), return `EventSourceResponse(traced_gen())` from `sse-starlette` instead or serialize them to SSE `str`/`bytes` frames.
+   - **Distinguish truncated and incomplete streams:** Track normal loop completion (`completed`) and preview truncation (`truncated`), emit `neatlogs.output_truncated` and `neatlogs.stream_incomplete`, and never record a cancelled or errored mid-stream prefix as a complete final `"reply"` (prefer recording the app's existing sanitized final assembled answer when available).
 
 ## Clean Root I/O & Provenance Contract
 
