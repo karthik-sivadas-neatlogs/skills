@@ -56,7 +56,7 @@ Layer `@neatlogs.span` / `neatlogs.log` only on your own orchestration and custo
 - `neatlogs.init()` MUST execute BEFORE any LLM library imports and BEFORE the client/agent is constructed/wrapped.
 - If `load_dotenv()` exists, it MUST run BEFORE `neatlogs.init()`.
 - Never hardcode API keys in source. Use `os.getenv()`.
-- For EU projects, set `endpoint="https://eu.ingest.neatlogs.com"` in `neatlogs.init()` — for standalone API-key (`NEATLOGS_API_KEY`) CLI commands (`neatlogs doctor --probe` / API-key `--trace`), pass `--endpoint https://eu.ingest.neatlogs.com` or set `NEATLOGS_ENDPOINT=https://eu.ingest.neatlogs.com`; for token-authenticated (`NEATLOGS_TOKEN` + `NEATLOGS_PROJECT_ID`) `doctor --trace` audits, set `NEATLOGS_HOST=https://eu.app.neatlogs.com` (the app origin — never point token-auth app-API audits at the ingest host). For other managed projects, omit `endpoint`, `NEATLOGS_ENDPOINT`, and `NEATLOGS_HOST`.
+- For EU projects, set `endpoint="https://eu.ingest.neatlogs.com"` in `neatlogs.init()` — for standalone API-key (`NEATLOGS_API_KEY`) CLI commands (`neatlogs doctor --probe` / API-key `--trace`), pass `--endpoint https://eu.ingest.neatlogs.com` or set `NEATLOGS_ENDPOINT=https://eu.ingest.neatlogs.com`; for token-authenticated (`NEATLOGS_TOKEN` + `NEATLOGS_PROJECT_ID`) `doctor --trace` audits, unset `NEATLOGS_API_KEY` (`env -u NEATLOGS_API_KEY`) and set `NEATLOGS_HOST=https://eu.app.neatlogs.com` (the app origin — never point token-auth app-API audits at the ingest host). For other managed projects, omit `endpoint`, `NEATLOGS_ENDPOINT`, and `NEATLOGS_HOST`.
 - `@neatlogs.span()` goes BELOW framework decorators (`@retry`, `@app.route`, `@tool`) — closest to `def`.
 - Ensure every `WORKFLOW` root captures clean, non-empty `input` (user request) and `output` (final reply — including a bounded, sanitized preview or final answer for streaming/SSE generators without altering yielded chunks).
 - For multi-turn apps, wire a stable conversation/thread `session_id` via `identify()` or the `WORKFLOW` root — never pass `trace_id` or a per-turn UUID as `session_id`.
@@ -177,10 +177,11 @@ After local Doctor passes and the requested instrumentation is in place:
    or set a matching `NEATLOGS_ENDPOINT` (for example,
    `python -m neatlogs doctor --trace <trace_id> --endpoint https://eu.ingest.neatlogs.com --json`);
    with `NEATLOGS_TOKEN` + `NEATLOGS_PROJECT_ID` (metadata-only public API
-   spans), set `NEATLOGS_HOST=https://eu.app.neatlogs.com` (the app origin —
-   never point token-authenticated audits at `eu.ingest.neatlogs.com` via
-   `--endpoint` or `NEATLOGS_ENDPOINT`, for example
-   `NEATLOGS_HOST=https://eu.app.neatlogs.com python -m neatlogs doctor --trace <trace_id> --json`).
+   spans), unset `NEATLOGS_API_KEY` (so Doctor does not prefer an exported SDK
+   key over token auth) and set `NEATLOGS_HOST=https://eu.app.neatlogs.com`
+   (the app origin — never point token-authenticated audits at
+   `eu.ingest.neatlogs.com` via `--endpoint` or `NEATLOGS_ENDPOINT`, for example
+   `env -u NEATLOGS_API_KEY NEATLOGS_HOST=https://eu.app.neatlogs.com python -m neatlogs doctor --trace <trace_id> --json`).
 
 Keep project credentials in the process environment or client secret storage;
 never put them in commands, output, files, or agent context. Do not use a

@@ -248,15 +248,23 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
         message="Help alice@example.com",
     )
 
-    # 1. Event filtering, PII redaction, split UTF-8 ('€' = \xe2\x82\xac), and invalid UTF-8
+    # 1. Event filtering (including event: AFTER data: per WHATWG SSE spec), JSON payload
+    # projection (excluding private metadata), PII/token redaction, split UTF-8 ('€'),
+    # invalid UTF-8 bytearray, and memoryview chunk support
     mut_chunk = bytearray(b"data:  bad-\xff-utf8\n\n")
+    mv_chunk = memoryview(b"data:  mv-ok\n\n")
     wire_chunks = [
         b"event: debug\ndata: secret debug-user@example.com\n\n",
+        b"data: internal-before-debug\nevent: debug\n\n",
         b": keepalive\n\n",
         b"event: meta\ndata: internal-state\n\n",
+        b'data: {"text": "Hello ", "metadata": {"email": "private@example.com", "secret": "xyz"}}\n\n',
+        b'data: {"delta": {"content": "world "}, "metadata": {"trace": "internal"}}\n\n',
+        b'data: {"type": "debug", "text": "hidden-json-debug"}\n\n',
         b"event: message\ndata: Total \xe2",
-        b"\x82\xac42 for bob@example.com\n\n",
+        b"\x82\xac42 for bob@example.com with Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig and sk-proj-abc1234567890xyz\n\n",
         mut_chunk,
+        mv_chunk,
         "data: [DONE]\n\n",
     ]
 
@@ -275,8 +283,10 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert yielded == wire_chunks
     for orig, out in zip(wire_chunks, yielded, strict=True):
         assert out is orig
-    # Confirm memoryview did not leave bytearray buffer locked
+    # Confirm bytearray buffer is unlocked and caller's memoryview was NOT released
     mut_chunk.extend(b"")
+    assert mv_chunk.tobytes() == b"data:  mv-ok\n\n"
+    mv_chunk.release()
 
     span = recorded_spans[-1]
     assert json.loads(span.attributes["input.value"]) == {
@@ -285,22 +295,41 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert span.attributes["neatlogs.output_truncated"] is False
     assert span.attributes["neatlogs.stream_incomplete"] is False
     output_payload = json.loads(span.attributes["output.value"])
-    assert output_payload == {"reply": "Total €42 for [REDACTED_EMAIL] bad-\ufffd-utf8"}
-    assert "debug-user@example.com" not in span.attributes["output.value"]
-    assert "bob@example.com" not in span.attributes["output.value"]
-    assert "internal-state" not in span.attributes["output.value"]
+    assert output_payload == {
+        "reply": (
+            "Hello world Total €42 for [REDACTED_EMAIL] with [REDACTED_TOKEN] "
+            "and [REDACTED_SECRET] bad-\ufffd-utf8 mv-ok"
+        )
+    }
+    for forbidden in (
+        "debug-user@example.com",
+        "internal-before-debug",
+        "bob@example.com",
+        "private@example.com",
+        "hidden-json-debug",
+        "internal-state",
+        "eyJhbGciOiJIUzI1NiJ9",
+        "sk-proj-abc1234567890xyz",
+        "metadata",
+    ):
+        assert forbidden not in span.attributes["output.value"]
 
-    # 2. Dict frame filtering (for sse-starlette EventSourceResponse)
+    # 2. Dict frame filtering & JSON/dict payload projection (for sse-starlette EventSourceResponse)
     dict_collector = collector_cls()
     dict_collector.feed({"event": "debug", "data": "leak@example.com"})
-    dict_collector.feed({"event": "message", "data": "Hi carol@example.com"})
-    dict_collector.feed({"data": "!"})
+    dict_collector.feed(
+        {"event": "message", "data": '{"text": "Hi carol@example.com", "metadata": {"secret": "no"}}'}
+    )
+    dict_collector.feed(
+        {"event": "message", "data": {"content": "!", "metadata": {"email": "hidden@example.com"}}}
+    )
     dict_collector.feed({"event": "message", "data": 123})
     assert dict_collector.finish(completed=True) == "Hi [REDACTED_EMAIL]!"
     assert dict_collector.truncated is False
 
-    # 3. 8 MiB byte chunk must NOT allocate ~8 MiB during decode and must set truncated=True
-    big_chunk = b"data: " + b"x" * (8 * 1024 * 1024) + b"\n\n"
+    # 3. 8 MiB byte chunk must NOT allocate ~8 MiB during decode, must set truncated=True,
+    # and must NOT dispatch an un-terminated frame whose event: debug may follow at the end
+    big_chunk = b"data: " + b"x" * (8 * 1024 * 1024) + b"\nevent: debug\n\n"
     mem_collector = collector_cls()
     tracemalloc.start()
     try:
@@ -310,9 +339,10 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
         tracemalloc.stop()
     assert peak < 512 * 1024, f"Expected bounded decode memory (<512 KiB), got {peak} bytes"
     assert mem_collector.truncated is True
-    assert mem_collector.finish(completed=True) == "x" * 4096
+    assert mem_collector.finish(completed=True) == ""
 
-    # 4. Raising chunk properties/methods must NEVER disrupt or terminate the stream
+    # 4. Raising chunk properties/methods must NEVER disrupt the stream, AND capture failure
+    # on a chunk (e.g. chunk B in A, B, C) must mark stream_incomplete=True + partial_reply
     class _HostileEvent:
         @property
         def text(self) -> str:
@@ -322,7 +352,23 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
         def get(self, *_args, **_kwargs):
             raise RuntimeError("dict get failed")
 
-    hostile_chunks = [_HostileEvent(), _HostileDict(), "data: ok\n\n"]
+    # Unknown object whose .text getter is never touched -> stream stays complete
+    async def _run_unknown_obj_stream():
+        async def _event_gen(_req):
+            yield _HostileEvent()
+            yield "data: ok\n\n"
+
+        ns["event_gen"] = _event_gen
+        resp = await chat_fn(req)
+        return [item async for item in resp.body_iterator]
+
+    unknown_out = asyncio.run(_run_unknown_obj_stream())
+    assert len(unknown_out) == 2
+    assert json.loads(recorded_spans[-1].attributes["output.value"]) == {"reply": "ok"}
+    assert recorded_spans[-1].attributes["neatlogs.stream_incomplete"] is False
+
+    # Chunk B raises during collector.feed -> A, B, C all yield untouched, but stream_incomplete=True
+    hostile_chunks = ["data: A\n\n", _HostileDict(), "data: C\n\n"]
 
     async def _run_hostile_stream():
         async def _event_gen(_req):
@@ -338,10 +384,16 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     for orig, out in zip(hostile_chunks, hostile_out, strict=True):
         assert out is orig
     hostile_span = recorded_spans[-1]
-    assert json.loads(hostile_span.attributes["output.value"]) == {"reply": "ok"}
-    assert hostile_span.attributes["neatlogs.stream_incomplete"] is False
+    assert hostile_span.attributes["neatlogs.stream_incomplete"] is True
+    hostile_payload = json.loads(hostile_span.attributes["output.value"])
+    assert "reply" not in hostile_payload
+    assert hostile_payload == {
+        "partial_reply": "AC",
+        "incomplete": True,
+        "truncated": False,
+    }
 
-    # 5. Stream exceeding cap marks truncated=True on both span attribute and output.value
+    # 5. Stream exceeding cap, boundary-crossing email, and post-redaction expansion cap
     async def _run_truncated_stream():
         async def _event_gen(_req):
             yield "data: " + ("a" * 5000) + "\n\n"
@@ -358,6 +410,53 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
         "reply": "a" * 4096,
         "truncated": True,
     }
+
+    # Boundary-crossing email (starts at 4088, crosses 4096) must be redacted BEFORE clipping
+    boundary_msg = ("a" * 4087) + " alice@example.com"
+    async def _run_boundary_stream():
+        async def _event_gen(_req):
+            yield "data: " + boundary_msg + "\n\n"
+
+        ns["event_gen"] = _event_gen
+        resp = await chat_fn(
+            types.SimpleNamespace(conversation_id="c-b", user_id="u-b", message=boundary_msg)
+        )
+        return [item async for item in resp.body_iterator]
+
+    asyncio.run(_run_boundary_stream())
+    boundary_span = recorded_spans[-1]
+    for attr_key, field_key in (("input.value", "message"), ("output.value", "reply")):
+        payload = json.loads(boundary_span.attributes[attr_key])
+        assert payload["truncated"] is True
+        assert len(payload[field_key]) == 4096
+        assert "alice" not in payload[field_key]
+        assert "@example" not in payload[field_key]
+
+    # 4,095-char string full of short emails expands past 4,096 on redaction -> must re-bound & set truncated=True
+    expanding_text = "a@b.co " * 585  # 4,095 chars -> 9,945 chars after redaction
+    assert len(expanding_text) == 4095
+
+    async def _run_expanding_stream():
+        async def _event_gen(_req):
+            yield "data: " + expanding_text + "\n\n"
+
+        ns["event_gen"] = _event_gen
+        resp = await chat_fn(
+            types.SimpleNamespace(conversation_id="c-e", user_id="u-e", message=expanding_text)
+        )
+        return [item async for item in resp.body_iterator]
+
+    asyncio.run(_run_expanding_stream())
+    exp_span = recorded_spans[-1]
+    assert exp_span.attributes["neatlogs.output_truncated"] is True
+    exp_in = json.loads(exp_span.attributes["input.value"])
+    exp_out = json.loads(exp_span.attributes["output.value"])
+    assert exp_in["truncated"] is True
+    assert len(exp_in["message"]) == 4096
+    assert "a@b.co" not in exp_in["message"]
+    assert exp_out["truncated"] is True
+    assert len(exp_out["reply"]) == 4096
+    assert "a@b.co" not in exp_out["reply"]
 
     # 6. Mid-stream error & early cancellation mark incomplete=True and avoid recording "reply"
     async def _run_errored_stream():
@@ -408,7 +507,7 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     assert cancel_payload["partial_reply"] == "first"
     assert cancel_payload["incomplete"] is True
 
-    # 7. Actual generator survives capture AND span.set_attribute failures completely undisturbed
+    # 7. Actual generator survives raising identity/message getters, capture failure, AND span.set_attribute failure
     class _FailingSpan:
         def set_attribute(self, _key: str, _value: object) -> None:
             raise RuntimeError("span attribute export failed")
@@ -418,8 +517,13 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
         yield _FailingSpan()
 
     class _BadRequest:
-        conversation_id = "conv-fail"
-        user_id = "user-fail"
+        @property
+        def conversation_id(self) -> str:
+            raise RuntimeError("conversation_id getter failed")
+
+        @property
+        def user_id(self) -> str:
+            raise RuntimeError("user_id getter failed")
 
         @property
         def message(self) -> str:
@@ -455,11 +559,11 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     for orig, out in zip(fail_chunks, fail_out, strict=True):
         assert out is orig
 
-    # 8. Oversized request input exports a bounded, PII-redacted application projection
+    # 8. Oversized request input exports a bounded, PII/secret-redacted application projection
     long_req = types.SimpleNamespace(
         conversation_id="conv-long",
         user_id="user-long",
-        message="Contact secret@example.com " + ("q" * 5000),
+        message="Authorization: Bearer tok_supersecret12345 Contact secret@example.com " + ("q" * 5000),
     )
 
     async def _run_long_input_stream():
@@ -475,7 +579,9 @@ def test_bdd_sse_streaming_recipe_is_sanitized_bounded_utf8_safe_and_fail_open()
     input_payload = json.loads(long_input_span.attributes["input.value"])
     assert input_payload["truncated"] is True
     assert "secret@example.com" not in input_payload["message"]
+    assert "tok_supersecret12345" not in input_payload["message"]
     assert "[REDACTED_EMAIL]" in input_payload["message"]
+    assert "[REDACTED_TOKEN]" in input_payload["message"]
     assert len(input_payload["message"]) <= 4096
 
 
@@ -527,12 +633,13 @@ def test_bdd_doctor_trace_examples_and_eu_notes_keep_doctor_on_trace_region() ->
             in text
         ), f"Missing EU API-key doctor --trace example in {doc_name}"
         assert (
-            "NEATLOGS_HOST=https://eu.app.neatlogs.com python -m neatlogs doctor --trace <trace_id> --json"
+            "env -u NEATLOGS_API_KEY NEATLOGS_HOST=https://eu.app.neatlogs.com python -m neatlogs doctor --trace <trace_id> --json"
             in text
-        ), f"Missing EU token-auth doctor --trace example in {doc_name}"
+        ), f"Missing EU token-auth doctor --trace example (unsetting NEATLOGS_API_KEY) in {doc_name}"
 
     assert "--endpoint https://eu.ingest.neatlogs.com" in add_init
     assert "NEATLOGS_ENDPOINT" in add_init
+    assert "env -u NEATLOGS_API_KEY" in add_init
     assert "NEATLOGS_HOST=https://eu.app.neatlogs.com" in add_init
     assert "| `NEATLOGS_ENDPOINT` |" in py_skill
     assert "| `NEATLOGS_HOST` |" in py_skill
