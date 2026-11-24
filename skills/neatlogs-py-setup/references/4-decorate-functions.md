@@ -135,46 +135,62 @@ For each function, answer in order:
            return None
 
 
-   def _extract_approved_dict_text(obj: dict) -> str:
+   def _has_error_tag(obj: dict) -> bool:
+       for tag_key in ("event", "type"):
+           val = obj.get(tag_key)
+           if isinstance(val, str) and val.lower() == "error":
+               return True
+       delta = obj.get("delta")
+       if isinstance(delta, dict):
+           for tag_key in ("event", "type"):
+               val = delta.get(tag_key)
+               if isinstance(val, str) and val.lower() == "error":
+                   return True
+       return False
+
+
+   def _extract_approved_dict_text(obj: dict) -> tuple[str, bool]:
+       if _has_error_tag(obj):
+           return "", True
        # Every present event/type tag must be allowlisted (don't let event="message" mask type="debug")
        for tag_key in ("event", "type"):
            if tag_key in obj:
                tag = obj[tag_key]
                if not isinstance(tag, str) or tag not in ALLOWED_SSE_EVENTS:
-                   return ""
+                   return "", False
        for key in ("text", "delta", "content"):
            val = obj.get(key)
            if isinstance(val, str):
-               return val
+               return val, False
            if key == "delta" and isinstance(val, dict):
                for tag_key in ("event", "type"):
                    if tag_key in val:
                        tag = val[tag_key]
                        if not isinstance(tag, str) or tag not in ALLOWED_SSE_EVENTS:
-                           return ""
+                           return "", False
                nested = val.get("text") or val.get("content")
                if isinstance(nested, str):
-                   return nested
-       return ""
+                   return nested, False
+       return "", False
 
 
-   def _extract_approved_payload_text(payload: object) -> str:
+   def _extract_approved_payload_text(payload: object) -> tuple[str, bool]:
        if isinstance(payload, dict):
            return _extract_approved_dict_text(payload)
        if not isinstance(payload, str) or not payload or payload == "[DONE]":
-           return ""
+           return "", False
        if len(payload) > MAX_DECODE_BYTES:
            head = payload[:MAX_DECODE_BYTES].lstrip()
-           return "" if (not head or head.startswith(("{", "["))) else payload[:MAX_SANITIZE_CHARS]
+           return ("" if (not head or head.startswith(("{", "["))) else payload[:MAX_SANITIZE_CHARS]), False
        stripped = payload.strip()
        if stripped.startswith(("{", "[")):
            try:
                parsed = json.loads(stripped)
            except ValueError:
                # Never export truncated/unparsed JSON wire objects or arrays
-               return ""
-           return _extract_approved_dict_text(parsed) if isinstance(parsed, dict) else ""
-       return payload
+               return "", False
+           return _extract_approved_dict_text(parsed) if isinstance(parsed, dict) else ("", False)
+       return payload, False
 
 
    def _project_request_input(req) -> dict[str, object]:
@@ -199,6 +215,7 @@ For each function, answer in order:
            self._parts: list[str] = []
            self._buffered_len = 0
            self.truncated = False
+           self.saw_error = False
 
        def _append_reply(self, text: str) -> None:
            if not text:
@@ -220,10 +237,16 @@ For each function, answer in order:
            data_lines = self._data_lines
            self._event_type = None
            self._data_lines = []
+           if event_name.lower() == "error":
+               self.saw_error = True
+               return
            if event_name not in ALLOWED_SSE_EVENTS or not data_lines:
                return
            raw_payload = "\n".join(data_lines)
-           extracted = _extract_approved_payload_text(raw_payload)
+           extracted, is_error = _extract_approved_payload_text(raw_payload)
+           if is_error:
+               self.saw_error = True
+               return
            if extracted:
                self._append_reply(extracted)
 
@@ -295,6 +318,9 @@ For each function, answer in order:
            # For sse-starlette EventSourceResponse dict frames (never pass raw dicts to StreamingResponse)
            if isinstance(chunk, dict):
                event_type = chunk.get("event", "message")
+               if isinstance(event_type, str) and event_type.lower() == "error":
+                   self.saw_error = True
+                   return
                if isinstance(event_type, str) and event_type in ALLOWED_SSE_EVENTS:
                    if "data" in chunk:
                        raw_data = chunk["data"]
@@ -306,9 +332,12 @@ For each function, answer in order:
                            self._append_reply(raw_data[:MAX_SANITIZE_CHARS])
                            self.truncated = True
                            return
-                       extracted = _extract_approved_payload_text(raw_data)
+                       extracted, is_error = _extract_approved_payload_text(raw_data)
                    else:
-                       extracted = _extract_approved_dict_text(chunk)
+                       extracted, is_error = _extract_approved_dict_text(chunk)
+                   if is_error:
+                       self.saw_error = True
+                       return
                    if extracted:
                        self._append_reply(extracted)
 
@@ -354,10 +383,14 @@ For each function, answer in order:
                        yield ev  # leave yielded wire chunks untouched
                    completed = True
                finally:
+                   preview = ""
                    try:
                        preview = collector.finish(completed=completed)
-                       stream_incomplete = (not completed) or capture_failed
-                       capture_truncated = input_truncated or collector.truncated
+                   except Exception:
+                       capture_failed = True
+                   stream_incomplete = (not completed) or capture_failed or collector.saw_error
+                   capture_truncated = input_truncated or collector.truncated
+                   try:
                        span.set_attribute("neatlogs.capture.truncated", capture_truncated)
                        span.set_attribute("neatlogs.stream.incomplete", stream_incomplete)
                        if not stream_incomplete:

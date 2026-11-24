@@ -841,6 +841,70 @@ def test_bdd_sse_recipe_traces_match_paired_doctor_readiness_rules() -> None:
     assert cap_res["jev_ready"] is False
     assert cap_res["replay_ready"] is False
 
+    # 6. collector.finish() raising -> still writes neatlogs.stream.incomplete=True and omits output.value
+    collector_cls = ns["_SSEPreviewCollector"]
+    orig_finish = collector_cls.finish
+
+    def _raising_finish(_self, *, completed: bool) -> str:
+        raise RuntimeError("scrubber crash in finish")
+
+    try:
+        collector_cls.finish = _raising_finish
+
+        async def _run_finish_failed():
+            async def _event_gen(_req):
+                yield "data: hello\n\n"
+
+            ns["event_gen"] = _event_gen
+            resp = await chat_fn(req)
+            return [item async for item in resp.body_iterator]
+
+        finish_out = asyncio.run(_run_finish_failed())
+    finally:
+        collector_cls.finish = orig_finish
+
+    assert finish_out == ["data: hello\n\n"]
+    fin_res, fin_checks = _audit_latest_span("trace-finish-failed")
+    assert "output.value" not in recorded_spans[-1].attributes
+    assert recorded_spans[-1].attributes["neatlogs.stream.incomplete"] is True
+    assert recorded_spans[-1].attributes["neatlogs.capture.truncated"] is False
+    assert fin_checks["root_io_present"] == "fail"
+    assert fin_checks["provenance_and_replayability"] == "fail"
+    assert fin_res["jev_ready"] is False
+    assert fin_res["replay_ready"] is False
+
+    # 7. Terminal SSE event: error (wire frame, JSON {"type": "error"}, and dict frame) ->
+    # stream yields cleanly but marks neatlogs.stream.incomplete=True and omits output.value
+    for label, err_chunks in (
+        ("sse-event-error", [b"data: Partial text\n\n", b"event: error\ndata: upstream timeout\n\n"]),
+        (
+            "json-type-error",
+            [b"data: Partial text\n\n", b'data: {"type": "error", "message": "rate limit"}\n\n'],
+        ),
+        (
+            "dict-event-error",
+            [{"event": "message", "data": "Partial"}, {"event": "error", "data": "boom"}],
+        ),
+    ):
+        async def _run_sse_error(chunks=err_chunks):
+            async def _event_gen(_req):
+                for item in chunks:
+                    yield item
+
+            ns["event_gen"] = _event_gen
+            resp = await chat_fn(req)
+            return [item async for item in resp.body_iterator]
+
+        err_ev_out = asyncio.run(_run_sse_error())
+        assert err_ev_out == err_chunks
+        ev_res, ev_checks = _audit_latest_span(f"trace-{label}")
+        assert "output.value" not in recorded_spans[-1].attributes, f"Leaked output.value for {label}"
+        assert recorded_spans[-1].attributes["neatlogs.stream.incomplete"] is True
+        assert ev_checks["root_io_present"] == "fail"
+        assert ev_checks["provenance_and_replayability"] == "fail"
+        assert ev_res["jev_ready"] is False
+        assert ev_res["replay_ready"] is False
+
 
 def test_bdd_checkpoint_docs_do_not_promise_automatic_scrubbing() -> None:
     """Given the checkpoint guidance in neatlogs-py-setup and neatlogs-py,
