@@ -49,7 +49,7 @@ Requires Python >= 3.10, < 3.14. Notable version pins: `crewai >= 1.9.3`.
 3. **One capture owner per operation** — wrappers, callback handlers, hooks, processors, native telemetry, and provider instrumentors own the spans they capture. Use `@span` for your own orchestration. Use manual `trace(kind="LLM")` only when no supported capture layer owns the LLM call.
 4. **Prefer the framework/provider-specific integration** over manual instrumentation. Never combine two capture layers for the same operation.
 5. **Init is single-shot**: `neatlogs.init()` configures the global telemetry provider. Calling it again is a no-op — it will NOT switch projects, even with a different `api_key`/`workflow_name`. If you need to reinitialize the SAME project, call `neatlogs.shutdown()` first (rare). If the need is a genuinely DIFFERENT project (different API key) from the same process, that's not a second `init()` at all — see [Multiple Projects](#multiple-projects-secondary-clients) below.
-6. **Region endpoint**: for EU projects, set `endpoint="https://eu.ingest.neatlogs.com"` in `neatlogs.init()`. For other managed projects, omit `endpoint` and `NEATLOGS_ENDPOINT`. Preserve an explicit self-hosted endpoint.
+6. **Region endpoint**: for EU projects, set `endpoint="https://eu.ingest.neatlogs.com"` in `neatlogs.init()`, and pass `--endpoint https://eu.ingest.neatlogs.com` (or set matching `NEATLOGS_ENDPOINT`) when running standalone CLI commands such as `neatlogs doctor --trace` or `--probe` so they do not default to the US host. For other managed projects, omit `endpoint` and `NEATLOGS_ENDPOINT`. Preserve an explicit self-hosted endpoint.
 7. **Read reference docs** before implementing — NeatLogs updates frequently.
 
 ### Transport selection
@@ -482,6 +482,7 @@ For deep dives, see the companion reference files:
 | Variable | Description |
 |---|---|
 | `NEATLOGS_API_KEY` | API key (alternative to `api_key` param) |
+| `NEATLOGS_ENDPOINT` | Ingest/audit endpoint for EU (`https://eu.ingest.neatlogs.com`) or self-hosted/custom-region projects (omit for default US managed projects) |
 | `NEATLOGS_ENVIRONMENT` | Deployment environment stamped on trace roots |
 | `NEATLOGS_RELEASE` | Deployment release / commit ID stamped on trace roots |
 
@@ -493,13 +494,15 @@ For deep dives, see the companion reference files:
 
 To make real workflow traces accurate for automated evaluation and step-by-step replay/backtracking:
 
-- **Root I/O & Sessions (all versions):** Ensure every `WORKFLOW` root records non-empty input and output (accumulating streamed output for SSE/generators), and bind a stable conversation `session_id` (never `trace_id` or a per-turn UUID).
+- **Root I/O & Sessions (all versions):** Ensure every `WORKFLOW` root records non-empty input and output (capturing a bounded, sanitized preview or existing final answer for SSE/generators without altering yielded wire chunks), and bind a stable conversation `session_id` (never `trace_id` or a per-turn UUID).
 - **Replayable Tools & Retrievers:** Pass `replay=True` on deterministic JSON-serializable, non-generator `@neatlogs.span(kind="TOOL", replay=True)` functions (all versions), and on `neatlogs >= 1.5.0` optionally on `RETRIEVER` / `RERANKER` / `VECTOR_STORE` / `MEMORY` / `GUARDRAIL` spans. Include freshness timestamps (`updated_at`) on retrieved document dicts.
-- **Provenance & Checkpoints (`neatlogs >= 1.5.0`):** Pass `environment`/`release` on `init()`, `prompt_version`/`checkpoint_id` on `@neatlogs.span(...)` or `neatlogs.trace(...)`, and use fail-open `neatlogs.checkpoint(checkpoint_id, *, state=None, state_delta=None)` or `neatlogs.report_diagnostic(category, message, *, severity="warning", details=None)` on multi-step loops.
-- **Real-Trace Readiness Audit (`neatlogs >= 1.5.0`):** After checking installed version and exercising one real workflow, obtain explicit user approval to audit the captured trace through the installed SDK (add `--expect-session` only for multi-turn apps and `--expect-retriever` only for RAG/retrieval apps; uses `NEATLOGS_API_KEY` for full payload verification against `/api/traces/v3`, whereas `NEATLOGS_TOKEN` + `NEATLOGS_PROJECT_ID` only checks metadata-only public spans):
+- **Provenance & Checkpoints (`neatlogs >= 1.5.0`):** Pass `environment`/`release` on `init()`, `prompt_version`/`checkpoint_id` on `@neatlogs.span(...)` or `neatlogs.trace(...)`, and use fail-open `neatlogs.checkpoint(checkpoint_id, *, state=None, state_delta=None)` or `neatlogs.report_diagnostic(category, message, *, severity="warning", details=None)` on multi-step loops. Because `state_delta` is serialized and exported as a span attribute without automatic PII/secret scrubbing, pass only allowlisted, already-sanitized fields — and prefer the digest-only path (hash sensitive state into `state_digest` via `state=...` and omit `state_delta`) whenever state may contain PII or secrets.
+- **Real-Trace Readiness Audit (`neatlogs >= 1.5.0`):** After checking installed version and exercising one real workflow, obtain explicit user approval to audit the captured trace through the installed SDK (add `--expect-session` only for multi-turn apps and `--expect-retriever` only for RAG/retrieval apps; uses `NEATLOGS_API_KEY` for full payload verification against `/api/traces/v3`, whereas `NEATLOGS_TOKEN` + `NEATLOGS_PROJECT_ID` only checks metadata-only public spans). Because `neatlogs doctor` runs as a separate CLI command, it defaults to the US endpoint even when `neatlogs.init(endpoint=...)` is set in app code — for EU or custom-region/self-hosted projects, pass `--endpoint` or set a matching `NEATLOGS_ENDPOINT` so the authenticated audit goes to the trace's region:
 
 ```bash
 python -m neatlogs doctor --trace <trace_id> --json
+# EU / custom-region projects (or set matching NEATLOGS_ENDPOINT in env):
+python -m neatlogs doctor --trace <trace_id> --endpoint https://eu.ingest.neatlogs.com --json
 # Add --expect-session for multi-turn apps and/or --expect-retriever for RAG apps
 ```
 

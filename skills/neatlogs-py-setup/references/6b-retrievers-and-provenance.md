@@ -74,11 +74,19 @@ On `neatlogs >= 1.5.0`, for long-running or branching agent loops where you want
 
 ```python
 # Requires neatlogs >= 1.5.0
+# Preferred digest-only path when state may contain PII or secrets:
+# pass `state` (hashed into `state_digest`) and omit `state_delta`.
 neatlogs.checkpoint(
     "after_retrieval",
     state={"ticket_id": ticket_id, "doc_count": len(docs)},
-    state_delta={"escalated": False},
 )
+
+# Only pass `state_delta` with allowlisted, already-sanitized, non-sensitive fields:
+# neatlogs.checkpoint(
+#     "after_policy_check",
+#     state={"ticket_id": ticket_id, "step": "policy"},
+#     state_delta={"escalated": False},
+# )
 
 if stale_docs:
     neatlogs.report_diagnostic(
@@ -89,4 +97,7 @@ if stale_docs:
     )
 ```
 
-Both helpers are bounded, fail-open, and scrub secrets automatically — never add blocking network I/O or per-request `neatlogs.flush()` calls on server hot paths.
+Privacy & safety rules for checkpoints and diagnostics:
+- **No automatic secret or PII scrubbing:** `state_delta` (and diagnostic `details`) are serialized and exported as span attributes, and application masking is not guaranteed by default. Callers **MUST** pass only allowlisted, already-sanitized, non-sensitive fields in `state_delta` and `details`.
+- **Prefer the digest-only path:** When loop state may contain PII, customer content, or secrets, hash sensitive state into `state_digest` by passing `state=...` and **omitting `state_delta`**.
+- Both helpers are bounded and fail-open — never add blocking network I/O or per-request `neatlogs.flush()` calls on server hot paths.

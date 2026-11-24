@@ -89,9 +89,23 @@ For each function, answer in order:
        return StreamingResponse(event_gen())
 
    # ✅ RIGHT — span lives inside the generator, stays open across all yields → one trace
+   MAX_PREVIEW_CHARS = 4096
+
+   def _preview_text(chunk) -> str:
+       if isinstance(chunk, str):
+           return chunk
+       if isinstance(chunk, (bytes, bytearray)):
+           return chunk.decode("utf-8", errors="replace")
+       if isinstance(chunk, dict):
+           val = chunk.get("text") or chunk.get("content") or chunk.get("data")
+           return val if isinstance(val, str) else ""
+       val = getattr(chunk, "text", None)
+       return val if isinstance(val, str) else ""
+
    async def chat(req):
        async def traced_gen():
-           chunks = []
+           preview_parts: list[str] = []
+           preview_len = 0
            with neatlogs.trace(
                "chat",
                kind="WORKFLOW",
@@ -101,12 +115,26 @@ For each function, answer in order:
                prompt_version="chat-v2",
            ) as span:
                span.set_attribute("input.value", json.dumps({"message": req.message}))
-               async for ev in event_gen(req):
-                   chunks.append(ev.text)
-                   yield ev
-               span.set_attribute("output.value", json.dumps({"reply": "".join(chunks)}))
+               try:
+                   async for ev in event_gen(req):
+                       if preview_len < MAX_PREVIEW_CHARS:
+                           piece = _preview_text(ev)
+                           if piece:
+                               take = piece[: MAX_PREVIEW_CHARS - preview_len]
+                               preview_parts.append(take)
+                               preview_len += len(take)
+                       yield ev  # leave yielded wire chunks untouched
+               finally:
+                   span.set_attribute(
+                       "output.value",
+                       json.dumps({"reply": "".join(preview_parts)}),
+                   )
        return StreamingResponse(traced_gen())
    ```
+
+   Keep streaming instrumentation non-invasive and bounded:
+   - Never assume chunks are objects with `.text` — SSE generators commonly yield raw `str`, `bytes`, or `dict` frames; leave yielded wire chunks untouched and handle unknown chunk types without raising.
+   - Cap telemetry buffering to a bounded, sanitized preview (e.g., `MAX_PREVIEW_CHARS = 4096` / 4 KB), or prefer recording the app's existing final assembled answer (sanitized for PII if needed) so telemetry memory never grows unboundedly with stream length.
 
 ## Clean Root I/O & Provenance Contract
 

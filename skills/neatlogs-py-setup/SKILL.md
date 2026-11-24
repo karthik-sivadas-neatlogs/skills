@@ -56,9 +56,9 @@ Layer `@neatlogs.span` / `neatlogs.log` only on your own orchestration and custo
 - `neatlogs.init()` MUST execute BEFORE any LLM library imports and BEFORE the client/agent is constructed/wrapped.
 - If `load_dotenv()` exists, it MUST run BEFORE `neatlogs.init()`.
 - Never hardcode API keys in source. Use `os.getenv()`.
-- For EU projects, set `endpoint="https://eu.ingest.neatlogs.com"` in `neatlogs.init()`; for other managed projects, omit `endpoint` and `NEATLOGS_ENDPOINT`.
+- For EU projects, set `endpoint="https://eu.ingest.neatlogs.com"` in `neatlogs.init()` — and pass `--endpoint https://eu.ingest.neatlogs.com` or set a matching `NEATLOGS_ENDPOINT` when running standalone CLI commands (`neatlogs doctor --trace` / `--probe`) so they do not default to the US host; for other managed projects, omit `endpoint` and `NEATLOGS_ENDPOINT`.
 - `@neatlogs.span()` goes BELOW framework decorators (`@retry`, `@app.route`, `@tool`) — closest to `def`.
-- Ensure every `WORKFLOW` root captures clean, non-empty `input` (user request) and `output` (final reply — including accumulated output for streaming/SSE generators).
+- Ensure every `WORKFLOW` root captures clean, non-empty `input` (user request) and `output` (final reply — including a bounded, sanitized preview or final answer for streaming/SSE generators without altering yielded chunks).
 - For multi-turn apps, wire a stable conversation/thread `session_id` via `identify()` or the `WORKFLOW` root — never pass `trace_id` or a per-turn UUID as `session_id`.
 - Never add synchronous network I/O or per-request `neatlogs.flush()` on server hot paths.
 - Minimal edits only. Add wrap()/handler/decorators + imports. Do not reformat, add comments, or refactor.
@@ -169,7 +169,13 @@ After local Doctor passes and the requested instrumentation is in place:
    older `v1.4.x` exits 4), you may also obtain approval to run
    `python -m neatlogs doctor --trace <trace_id> --json` (using
    `NEATLOGS_API_KEY` for full payload checks, or `--file <trace.json> --json`
-   offline) to check real-trace evaluation and replay readiness.
+   offline) to check real-trace evaluation and replay readiness. Because
+   `neatlogs doctor` runs as a separate CLI command, it defaults to the US
+   endpoint unless configured — for EU or custom-region projects, pass
+   `--endpoint https://eu.ingest.neatlogs.com` (or your custom endpoint) or set
+   a matching `NEATLOGS_ENDPOINT` in the environment so the authenticated audit
+   targets the trace's region (for example,
+   `python -m neatlogs doctor --trace <trace_id> --endpoint https://eu.ingest.neatlogs.com --json`).
 
 Keep project credentials in the process environment or client secret storage;
 never put them in commands, output, files, or agent context. Do not use a

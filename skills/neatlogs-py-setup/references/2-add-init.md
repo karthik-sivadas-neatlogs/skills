@@ -66,7 +66,7 @@ neatlogs.init(api_key=os.getenv("NEATLOGS_API_KEY"), ...)
 
 The SDK CAN read NEATLOGS_API_KEY from env internally, but only if `load_dotenv()` ran first AND the env var is available in the process. Passing it explicitly guarantees it works in all cases: Docker, CI, systemd, cron, and projects that don't use dotenv.
 
-For EU projects, pass `endpoint="https://eu.ingest.neatlogs.com"` to `neatlogs.init()`. For other managed projects, omit `endpoint=`.
+For EU projects, pass `endpoint="https://eu.ingest.neatlogs.com"` to `neatlogs.init()`, and pass `--endpoint https://eu.ingest.neatlogs.com` (or set matching `NEATLOGS_ENDPOINT`) when running standalone CLI commands such as `python -m neatlogs doctor --trace`. For other managed projects, omit `endpoint=` and `NEATLOGS_ENDPOINT`.
 
 ## Verify BEFORE moving to step 3
 
