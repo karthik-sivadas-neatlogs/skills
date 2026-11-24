@@ -96,7 +96,8 @@ For each function, answer in order:
 
    MAX_PREVIEW_CHARS = 4096
    MAX_SANITIZE_CHARS = MAX_PREVIEW_CHARS * 2  # sanitize bounded lookahead before clipping
-   MAX_DECODE_BYTES = MAX_PREVIEW_CHARS * 4  # cap raw bytes decoded across the stream
+   MAX_DECODE_BYTES = MAX_PREVIEW_CHARS * 4  # cap raw bytes buffered for preview text
+   _ERROR_SCAN_STEP = 4096  # O(1) bounded slice size for post-budget terminal-error scanning
    ALLOWED_SSE_EVENTS = frozenset({"message", "delta", "text", "content"})
    _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
    _BEARER_RE = re.compile(r"(?i)\b(?:authorization\s*:\s*)?bearer\s+\S+")
@@ -210,6 +211,7 @@ For each function, answer in order:
            self._chars_remaining = MAX_DECODE_BYTES
            self._seen_text = False
            self._line_buf = ""
+           self._skip_long_line = False
            self._event_type: str | None = None
            self._data_lines: list[str] = []
            self._parts: list[str] = []
@@ -217,17 +219,24 @@ For each function, answer in order:
            self.truncated = False
            self.saw_error = False
 
+       def _enter_error_scan_mode(self) -> None:
+           self.truncated = True
+           self._data_lines = []
+           if len(self._line_buf) > _ERROR_SCAN_STEP:
+               self._line_buf = ""
+               self._skip_long_line = True
+
        def _append_reply(self, text: str) -> None:
            if not text:
                return
            remaining = MAX_SANITIZE_CHARS - self._buffered_len
            if remaining <= 0:
-               self.truncated = True
+               self._enter_error_scan_mode()
                return
            if len(text) > remaining:
                self._parts.append(text[:remaining])
                self._buffered_len = MAX_SANITIZE_CHARS
-               self.truncated = True
+               self._enter_error_scan_mode()
            else:
                self._parts.append(text)
                self._buffered_len += len(text)
@@ -247,7 +256,7 @@ For each function, answer in order:
            if is_error:
                self.saw_error = True
                return
-           if extracted:
+           if extracted and not self.truncated:
                self._append_reply(extracted)
 
        def _consume_line(self, line: str) -> None:
@@ -266,7 +275,27 @@ For each function, answer in order:
                    payload = payload[1:]
                self._data_lines.append(payload)
 
-       def _consume_text(self, text: str, *, final: bool = False) -> None:
+       def _consume_error_line(self, line: str) -> None:
+           if line == "":
+               if (self._event_type or "").lower() == "error":
+                   self.saw_error = True
+               self._event_type = None
+               return
+           if line.startswith(":"):
+               return
+           if line.startswith("event:"):
+               self._event_type = line[6:].strip() or None
+               return
+           if line.startswith("data:"):
+               payload = line[5:]
+               if payload.startswith(" "):
+                   payload = payload[1:]
+               if payload.lstrip().startswith("{"):
+                   _, is_error = _extract_approved_payload_text(payload)
+                   if is_error:
+                       self.saw_error = True
+
+       def _consume_text(self, text: str, *, final: bool = False, error_only: bool = False) -> None:
            if not self._seen_text and text:
                self._seen_text = True
                if text.startswith("\ufeff"):
@@ -274,27 +303,77 @@ For each function, answer in order:
            self._line_buf += text
            pos = 0
            buf = self._line_buf
+           handler = self._consume_error_line if error_only else self._consume_line
            for match in _LINE_END_RE.finditer(buf):
                if match.group(0) == "\r" and match.end() == len(buf) and not final:
                    break  # wait for next chunk in case \r is split across \r\n
-               self._consume_line(buf[pos : match.start()])
+               handler(buf[pos : match.start()])
                pos = match.end()
+               if self.saw_error:
+                   self._line_buf = ""
+                   return
            self._line_buf = buf[pos:]
+           if error_only and len(self._line_buf) > _ERROR_SCAN_STEP:
+               self._line_buf = ""
+               self._skip_long_line = True
+
+       def _scan_error_bytes(self, byte_mv: memoryview) -> None:
+           # O(1) bounded scan after preview budget is exhausted so late event: error is never missed
+           for offset in range(0, len(byte_mv), _ERROR_SCAN_STEP):
+               if self.saw_error:
+                   return
+               with byte_mv[offset : offset + _ERROR_SCAN_STEP] as step:
+                   if self._skip_long_line:
+                       raw = bytes(step)
+                       nl = raw.find(b"\n")
+                       cr = raw.find(b"\r")
+                       if nl == -1 and cr == -1:
+                           continue
+                       idx = nl if cr == -1 else (cr if nl == -1 else min(nl, cr))
+                       self._skip_long_line = False
+                       self._decoder.reset()
+                       self._line_buf = "_"  # preserve skipped non-empty line before terminator
+                       decoded = self._decoder.decode(raw[idx:], final=False)
+                   else:
+                       decoded = self._decoder.decode(step, final=False)
+               self._consume_text(decoded, error_only=True)
+
+       def _scan_error_str(self, text: str) -> None:
+           for offset in range(0, len(text), _ERROR_SCAN_STEP):
+               if self.saw_error:
+                   return
+               step = text[offset : offset + _ERROR_SCAN_STEP]
+               if self._skip_long_line:
+                   nl = step.find("\n")
+                   cr = step.find("\r")
+                   if nl == -1 and cr == -1:
+                       continue
+                   idx = nl if cr == -1 else (cr if nl == -1 else min(nl, cr))
+                   self._skip_long_line = False
+                   self._line_buf = "_"
+                   step = step[idx:]
+               self._consume_text(step, error_only=True)
 
        def feed(self, chunk) -> None:
-           if self.truncated:
+           if self.saw_error:
                return
            if isinstance(chunk, (bytes, bytearray, memoryview)):
                own_mv = None if isinstance(chunk, memoryview) else memoryview(chunk)
                mv = chunk if own_mv is None else own_mv
                byte_mv = mv if (mv.ndim == 1 and mv.format == "B") else mv.cast("B")
                try:
+                   if self.truncated:
+                       self._scan_error_bytes(byte_mv)
+                       return
                    if len(byte_mv) > self._bytes_remaining:
-                       with byte_mv[: self._bytes_remaining] as head:
+                       split_at = self._bytes_remaining
+                       with byte_mv[:split_at] as head:
                            decoded = self._decoder.decode(head, final=False)
                        self._bytes_remaining = 0
                        self._consume_text(decoded)
-                       self.truncated = True
+                       self._enter_error_scan_mode()
+                       with byte_mv[split_at:] as rest:
+                           self._scan_error_bytes(rest)
                        return
                    self._bytes_remaining -= len(byte_mv)
                    decoded = self._decoder.decode(byte_mv, final=False)
@@ -306,11 +385,15 @@ For each function, answer in order:
                    if own_mv is not None:
                        own_mv.release()
            if isinstance(chunk, str):
+               if self.truncated:
+                   self._scan_error_str(chunk)
+                   return
                if len(chunk) > self._chars_remaining:
-                   sliced = chunk[: self._chars_remaining]
+                   split_at = self._chars_remaining
                    self._chars_remaining = 0
-                   self._consume_text(sliced)
-                   self.truncated = True
+                   self._consume_text(chunk[:split_at])
+                   self._enter_error_scan_mode()
+                   self._scan_error_str(chunk[split_at:])
                    return
                self._chars_remaining -= len(chunk)
                self._consume_text(chunk)
@@ -327,10 +410,11 @@ For each function, answer in order:
                        if isinstance(raw_data, str) and len(raw_data) > MAX_DECODE_BYTES:
                            head = raw_data[:MAX_DECODE_BYTES].lstrip()
                            if not head or head.startswith(("{", "[")):
-                               self.truncated = True
+                               self._enter_error_scan_mode()
                                return
-                           self._append_reply(raw_data[:MAX_SANITIZE_CHARS])
-                           self.truncated = True
+                           if not self.truncated:
+                               self._append_reply(raw_data[:MAX_SANITIZE_CHARS])
+                           self._enter_error_scan_mode()
                            return
                        extracted, is_error = _extract_approved_payload_text(raw_data)
                    else:
@@ -338,13 +422,13 @@ For each function, answer in order:
                    if is_error:
                        self.saw_error = True
                        return
-                   if extracted:
+                   if extracted and not self.truncated:
                        self._append_reply(extracted)
 
        def finish(self, *, completed: bool) -> str:
-           if completed and not self.truncated:
+           if completed and not self.saw_error:
                tail = self._decoder.decode(b"", final=True)
-               self._consume_text(tail, final=True)
+               self._consume_text(tail, final=True, error_only=self.truncated)
            sanitized, self.truncated = _sanitize_and_bound(
                "".join(self._parts),
                already_truncated=self.truncated,
@@ -357,6 +441,7 @@ For each function, answer in order:
        # (convert upstream bytearray chunks with bytes(chunk) before yielding to StreamingResponse)
        async def traced_gen():
            collector = _SSEPreviewCollector()
+           # Authoritative stream completion state (also combine your app's own error/abort flag if any)
            completed = False
            capture_failed = False
            input_truncated = False
@@ -388,12 +473,18 @@ For each function, answer in order:
                        preview = collector.finish(completed=completed)
                    except Exception:
                        capture_failed = True
-                   stream_incomplete = (not completed) or capture_failed or collector.saw_error
+                   has_answer = bool(preview.strip())
+                   stream_incomplete = (
+                       (not completed)
+                       or capture_failed
+                       or collector.saw_error
+                       or (not has_answer)
+                   )
                    capture_truncated = input_truncated or collector.truncated
                    try:
                        span.set_attribute("neatlogs.capture.truncated", capture_truncated)
                        span.set_attribute("neatlogs.stream.incomplete", stream_incomplete)
-                       if not stream_incomplete:
+                       if not stream_incomplete and has_answer:
                            output_payload: dict[str, object] = {"reply": preview}
                            if collector.truncated:
                                output_payload["truncated"] = True
@@ -405,10 +496,10 @@ For each function, answer in order:
 
    Keep streaming instrumentation non-invasive, sanitized, and bounded:
    - **Export approved, sanitized application-level projections — never raw request text or raw wire payloads:** Project only allowlisted, bounded, PII-redacted application fields for `input.value` and dispatch SSE frames only on the blank-line terminator (per WHATWG SSE spec, so `event: debug` appearing after `data:` is still filtered). For JSON/dict `data:` payloads, extract only allowlisted assistant text fields (`text`, `delta`, `content`) rather than exporting full JSON or `metadata`. Sanitize emails, bearer tokens, and API keys *before* clipping to `MAX_PREVIEW_CHARS` (and re-bound after redaction so redaction expansion still respects the cap and sets `truncated`).
-   - **Bound raw byte decoding & preserve split UTF-8:** Cap raw bytes (`bytes`, `bytearray`, or `memoryview`) sliced into `codecs.getincrementaldecoder("utf-8")(errors="replace")` *before* decoding (so a multi-megabyte byte chunk never allocates megabytes and multi-byte UTF-8 characters like `€` split across chunks decode cleanly).
+   - **Bound raw byte decoding & preserve split UTF-8:** Cap raw bytes (`bytes`, `bytearray`, or `memoryview`) buffered for preview text into `codecs.getincrementaldecoder("utf-8")(errors="replace")` *before* decoding (so a multi-megabyte byte chunk never allocates megabytes and multi-byte UTF-8 characters like `€` split across chunks decode cleanly), while continuing a constant-memory error-tag scan so a late terminal `event: error` is never missed after the preview budget is exhausted.
    - **Fail-open telemetry capture & attribute writes:** Guard identity attribute lookups (`conversation_id`/`user_id`), input projection, preview extraction, and `span.set_attribute(...)` calls in `try: ... except Exception: pass` and leave yielded wire chunks untouched so capture/attribute failures or raising property getters can never disrupt or terminate the application stream.
    - **Match the response class to your chunk type:** Starlette's `StreamingResponse` accepts only `str`, `bytes`, or `memoryview` chunks (passing raw `dict` or `bytearray` frames raises `AttributeError` — convert upstream `bytearray` chunks via `bytes(chunk)` before yielding) and requires `media_type="text/event-stream"` for SSE. If your generator yields `dict` frames (e.g. `{"event": "message", "data": "..."}`), return `EventSourceResponse(traced_gen())` from `sse-starlette` instead or serialize them to SSE `str`/`bytes` frames.
-   - **Distinguish truncated and incomplete streams with canonical Doctor flags:** Track normal loop completion (`completed`), per-chunk capture errors (`capture_failed`), and input/preview truncation (`capture_truncated`), emit `neatlogs.capture.truncated` and `neatlogs.stream.incomplete`, and omit final root `output.value` completely whenever the stream is incomplete (cancelled, errored, or capture-failed) so `neatlogs doctor --trace` never counts a partial prefix as a final answer (prefer recording the app's existing sanitized final assembled answer when available).
+   - **Use authoritative completion state & emit canonical Doctor flags:** Track authoritative stream completion independently of preview capture (`completed`, `collector.saw_error`, `capture_failed`, plus any app-level abort/error flag) and input/preview truncation (`capture_truncated`), emit `neatlogs.capture.truncated` and `neatlogs.stream.incomplete`, and omit final root `output.value` unless a nonempty completed answer is known (never emit `{"reply": ""}` or publish a partial prefix after an error, cancellation, or capture failure — prefer recording the app's existing sanitized final assembled answer when available).
 
 ## Clean Root I/O & Provenance Contract
 

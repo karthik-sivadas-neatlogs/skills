@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -650,6 +651,9 @@ def _audit_sse_trace_with_doctor(
     except ImportError:
         audit_trace = None
 
+    if os.getenv("NEATLOGS_REQUIRE_PAIRED_SDK") == "1":
+        assert audit_trace is not None, "Expected real paired neatlogs.trace_audit.audit_trace"
+
     if audit_trace is not None:
         return audit_trace(trace, spans)
 
@@ -904,6 +908,76 @@ def test_bdd_sse_recipe_traces_match_paired_doctor_readiness_rules() -> None:
         assert ev_checks["provenance_and_replayability"] == "fail"
         assert ev_res["jev_ready"] is False
         assert ev_res["replay_ready"] is False
+
+    # 8. Late terminal error AFTER the 16 KiB preview budget is exhausted (iterator ends normally)
+    # -> must still detect saw_error, omit output.value, and fail paired Doctor jev_ready & replay_ready
+    for label, late_chunks in (
+        (
+            "late-bytes-event-error",
+            [b"data: " + (b"x" * 4500) + b"\n\n" for _ in range(5)]
+            + [b"event: error\ndata: upstream died late\n\n"],
+        ),
+        (
+            "late-str-json-error",
+            ["data: " + ("y" * 4500) + "\n\n" for _ in range(5)]
+            + ['data: {"type": "error", "message": "late json error"}\n\n'],
+        ),
+        (
+            "late-8mib-chunk-event-error",
+            [b"data: " + (b"z" * (8 * 1024 * 1024)) + b"\nevent: error\n\n"],
+        ),
+        (
+            "late-dict-event-error",
+            [{"event": "message", "data": "w" * 9000}, {"event": "error", "data": "late dict err"}],
+        ),
+    ):
+        async def _run_late_error(chunks=late_chunks):
+            async def _event_gen(_req):
+                for item in chunks:
+                    yield item
+
+            ns["event_gen"] = _event_gen
+            resp = await chat_fn(req)
+            return [item async for item in resp.body_iterator]
+
+        late_out = asyncio.run(_run_late_error())
+        assert len(late_out) == len(late_chunks)
+        late_res, late_checks = _audit_latest_span(f"trace-{label}")
+        assert "output.value" not in recorded_spans[-1].attributes, f"Published partial prefix for {label}"
+        assert recorded_spans[-1].attributes["neatlogs.stream.incomplete"] is True
+        assert recorded_spans[-1].attributes["neatlogs.capture.truncated"] is True
+        assert late_checks["root_io_present"] == "fail"
+        assert late_checks["provenance_and_replayability"] == "fail"
+        assert late_res["jev_ready"] is False
+        assert late_res["replay_ready"] is False
+
+    # 9. No-answer streams ending normally -> must NOT emit {"reply": ""}; omit output.value so
+    # paired Doctor marks root_io_present=fail, jev_ready=False, replay_ready=False
+    for label, empty_chunks in (
+        ("empty-stream", []),
+        ("keepalive-only", [b": keepalive\n\n"]),
+        ("debug-only", [b"event: debug\ndata: secret\n\n"]),
+        ("done-only", ["data: [DONE]\n\n"]),
+        ("whitespace-only", ["data:    \n\n"]),
+    ):
+        async def _run_empty_stream(chunks=empty_chunks):
+            async def _event_gen(_req):
+                for item in chunks:
+                    yield item
+
+            ns["event_gen"] = _event_gen
+            resp = await chat_fn(req)
+            return [item async for item in resp.body_iterator]
+
+        empty_out = asyncio.run(_run_empty_stream())
+        assert empty_out == empty_chunks
+        empty_res, empty_checks = _audit_latest_span(f"trace-{label}")
+        assert "output.value" not in recorded_spans[-1].attributes, f"Emitted empty reply for {label}"
+        assert recorded_spans[-1].attributes["neatlogs.stream.incomplete"] is True
+        assert empty_checks["root_io_present"] == "fail"
+        assert empty_checks["provenance_and_replayability"] == "fail"
+        assert empty_res["jev_ready"] is False
+        assert empty_res["replay_ready"] is False
 
 
 def test_bdd_checkpoint_docs_do_not_promise_automatic_scrubbing() -> None:
