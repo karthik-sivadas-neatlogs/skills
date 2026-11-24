@@ -97,9 +97,11 @@ For each function, answer in order:
    MAX_SANITIZE_CHARS = MAX_PREVIEW_CHARS * 2  # sanitize bounded lookahead before clipping
    _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
    _BEARER_RE = re.compile(r"(?i)\b(?:authorization\s*:\s*)?bearer\s+\S+")
-   _API_KEY_RE = re.compile(r"\b(?:sk|pk|nl[a-z]{0,2})[-_][A-Za-z0-9_-]{12,}\b")
+   _API_KEY_RE = re.compile(
+       r"(?:(?<![A-Za-z0-9])(?:sk|pk|nl[a-z]{0,2})[-_][A-Za-z0-9_-]{12,}|(?i:\bx-api-key\s*:\s*\S+))"
+   )
    _TRAILING_EMAIL_FRAG_RE = re.compile(r"(?:^|(?<=\s))\S*@\S*$")
-   _TRAILING_KEY_FRAG_RE = re.compile(r"\b(?:sk|pk|nl[a-z]{0,2})[-_]\S*$")
+   _TRAILING_KEY_FRAG_RE = re.compile(r"(?:(?<![A-Za-z0-9])(?:sk|pk|nl[a-z]{0,2})[-_]\S*$)")
 
 
    def _redact_pii(text: str) -> str:
@@ -218,14 +220,17 @@ For each function, answer in order:
                        or (not has_answer)
                    )
                    capture_truncated = input_truncated or preview_truncated
-                   try:
-                       span.set_attribute("neatlogs.capture.truncated", capture_truncated)
-                       span.set_attribute("neatlogs.stream.incomplete", stream_incomplete)
-                       if not stream_incomplete and has_answer:
+                   if not stream_incomplete and has_answer:
+                       try:
                            output_payload: dict[str, object] = {"reply": preview}
                            if preview_truncated:
                                output_payload["truncated"] = True
                            span.set_attribute("output.value", json.dumps(output_payload))
+                       except Exception:
+                           stream_incomplete = True
+                   try:
+                       span.set_attribute("neatlogs.capture.truncated", capture_truncated)
+                       span.set_attribute("neatlogs.stream.incomplete", stream_incomplete)
                    except Exception:
                        pass
        return StreamingResponse(traced_gen(), media_type="text/event-stream")

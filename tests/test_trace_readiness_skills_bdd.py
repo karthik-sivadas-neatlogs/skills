@@ -654,14 +654,15 @@ def test_bdd_sse_recipe_traces_match_paired_doctor_readiness_rules() -> None:
     assert trunc_report["jev_ready"] is True
     assert trunc_report["replay_ready"] is False
 
-    # 3. Late error AFTER preview budget is exhausted (same 9,000-char prefix, but ends with error
-    # instead of done and returns normally) -> output.value OMITTED, no child-tool backfill,
+    # 3. Late error AFTER preview budget is exhausted (same 9,000-char prefix, followed by error
+    # AND done so only saw_error suppresses output) -> output.value OMITTED, no child-tool backfill,
     # jev_ready=False, replay_ready=False
     def _late_error_gen(emit_tool):
         async def _gen(_req):
             emit_tool()
             yield {"kind": "delta", "text": "a" * 9000}
             yield {"kind": "error"}
+            yield {"kind": "done"}
 
         return _gen
 
