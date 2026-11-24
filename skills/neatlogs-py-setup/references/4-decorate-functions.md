@@ -88,23 +88,18 @@ For each function, answer in order:
    async def chat(...):
        return StreamingResponse(event_gen(), media_type="text/event-stream")
 
-   # ✅ RIGHT — span lives inside the generator, stays open across all yields → one trace
-   import codecs
+   # ✅ RIGHT — instrument typed app events inside the generator before SSE wire encoding
    import json
    import re
    from starlette.responses import StreamingResponse
 
    MAX_PREVIEW_CHARS = 4096
    MAX_SANITIZE_CHARS = MAX_PREVIEW_CHARS * 2  # sanitize bounded lookahead before clipping
-   MAX_DECODE_BYTES = MAX_PREVIEW_CHARS * 4  # cap raw bytes buffered for preview text
-   _ERROR_SCAN_STEP = 4096  # O(1) bounded slice size for post-budget terminal-error scanning
-   ALLOWED_SSE_EVENTS = frozenset({"message", "delta", "text", "content"})
    _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
    _BEARER_RE = re.compile(r"(?i)\b(?:authorization\s*:\s*)?bearer\s+\S+")
    _API_KEY_RE = re.compile(r"\b(?:sk|pk|nl[a-z]{0,2})[-_][A-Za-z0-9_-]{12,}\b")
    _TRAILING_EMAIL_FRAG_RE = re.compile(r"(?:^|(?<=\s))\S*@\S*$")
    _TRAILING_KEY_FRAG_RE = re.compile(r"\b(?:sk|pk|nl[a-z]{0,2})[-_]\S*$")
-   _LINE_END_RE = re.compile(r"\r\n|\r|\n")
 
 
    def _redact_pii(text: str) -> str:
@@ -118,7 +113,6 @@ For each function, answer in order:
        exceeded = already_truncated or len(text) > MAX_SANITIZE_CHARS
        window = text[:MAX_SANITIZE_CHARS]
        if exceeded:
-           # Guard incomplete email/key fragments cut at the lookahead or collector boundary
            window = _TRAILING_EMAIL_FRAG_RE.sub("[REDACTED_EMAIL]", window)
            window = _TRAILING_KEY_FRAG_RE.sub("[REDACTED_SECRET]", window)
        sanitized = _redact_pii(window)
@@ -136,314 +130,38 @@ For each function, answer in order:
            return None
 
 
-   def _has_error_tag(obj: dict) -> bool:
-       for tag_key in ("event", "type"):
-           val = obj.get(tag_key)
-           if isinstance(val, str) and val.lower() == "error":
-               return True
-       delta = obj.get("delta")
-       if isinstance(delta, dict):
-           for tag_key in ("event", "type"):
-               val = delta.get(tag_key)
-               if isinstance(val, str) and val.lower() == "error":
-                   return True
-       return False
-
-
-   def _extract_approved_dict_text(obj: dict) -> tuple[str, bool]:
-       if _has_error_tag(obj):
-           return "", True
-       # Every present event/type tag must be allowlisted (don't let event="message" mask type="debug")
-       for tag_key in ("event", "type"):
-           if tag_key in obj:
-               tag = obj[tag_key]
-               if not isinstance(tag, str) or tag not in ALLOWED_SSE_EVENTS:
-                   return "", False
-       for key in ("text", "delta", "content"):
-           val = obj.get(key)
-           if isinstance(val, str):
-               return val, False
-           if key == "delta" and isinstance(val, dict):
-               for tag_key in ("event", "type"):
-                   if tag_key in val:
-                       tag = val[tag_key]
-                       if not isinstance(tag, str) or tag not in ALLOWED_SSE_EVENTS:
-                           return "", False
-               nested = val.get("text") or val.get("content")
-               if isinstance(nested, str):
-                   return nested, False
-       return "", False
-
-
-   def _extract_approved_payload_text(payload: object) -> tuple[str, bool]:
-       if isinstance(payload, dict):
-           return _extract_approved_dict_text(payload)
-       if not isinstance(payload, str) or not payload or payload == "[DONE]":
-           return "", False
-       if len(payload) > MAX_DECODE_BYTES:
-           head = payload[:MAX_DECODE_BYTES].lstrip()
-           return ("" if (not head or head.startswith(("{", "["))) else payload[:MAX_SANITIZE_CHARS]), False
-       stripped = payload.strip()
-       if stripped.startswith(("{", "[")):
-           try:
-               parsed = json.loads(stripped)
-           except ValueError:
-               # Never export truncated/unparsed JSON wire objects or arrays
-               return "", False
-           return _extract_approved_dict_text(parsed) if isinstance(parsed, dict) else ("", False)
-       return payload, False
-
-
-   def _project_request_input(req) -> dict[str, object]:
-       # Export an approved, sanitized application-level projection — never raw request bodies
+   def _project_request_input(req) -> tuple[dict[str, object], bool]:
+       # Approved, sanitized application-level projection — never raw request bodies
        text = _safe_str_attr(req, "message") or ""
        sanitized, truncated = _sanitize_and_bound(text)
        projection: dict[str, object] = {"message": sanitized}
        if truncated:
            projection["truncated"] = True
-       return projection
+       return projection, truncated
 
 
-   class _SSEPreviewCollector:
-       def __init__(self) -> None:
-           self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-           self._bytes_remaining = MAX_DECODE_BYTES
-           self._chars_remaining = MAX_DECODE_BYTES
-           self._seen_text = False
-           self._line_buf = ""
-           self._skip_long_line = False
-           self._event_type: str | None = None
-           self._data_lines: list[str] = []
-           self._parts: list[str] = []
-           self._buffered_len = 0
-           self.truncated = False
-           self.saw_error = False
-
-       def _enter_error_scan_mode(self) -> None:
-           self.truncated = True
-           self._data_lines = []
-           if len(self._line_buf) > _ERROR_SCAN_STEP:
-               self._line_buf = ""
-               self._skip_long_line = True
-
-       def _append_reply(self, text: str) -> None:
-           if not text:
-               return
-           remaining = MAX_SANITIZE_CHARS - self._buffered_len
-           if remaining <= 0:
-               self._enter_error_scan_mode()
-               return
-           if len(text) > remaining:
-               self._parts.append(text[:remaining])
-               self._buffered_len = MAX_SANITIZE_CHARS
-               self._enter_error_scan_mode()
-           else:
-               self._parts.append(text)
-               self._buffered_len += len(text)
-
-       def _dispatch_event(self) -> None:
-           event_name = self._event_type or "message"
-           data_lines = self._data_lines
-           self._event_type = None
-           self._data_lines = []
-           if event_name.lower() == "error":
-               self.saw_error = True
-               return
-           if event_name not in ALLOWED_SSE_EVENTS or not data_lines:
-               return
-           raw_payload = "\n".join(data_lines)
-           extracted, is_error = _extract_approved_payload_text(raw_payload)
-           if is_error:
-               self.saw_error = True
-               return
-           if extracted and not self.truncated:
-               self._append_reply(extracted)
-
-       def _consume_line(self, line: str) -> None:
-           if line == "":
-               # Per WHATWG SSE spec, dispatch only on blank-line terminator
-               self._dispatch_event()
-               return
-           if line.startswith(":"):
-               return  # SSE comment / keepalive
-           if line.startswith("event:"):
-               self._event_type = line[6:].strip() or None
-               return
-           if line.startswith("data:"):
-               payload = line[5:]
-               if payload.startswith(" "):
-                   payload = payload[1:]
-               self._data_lines.append(payload)
-
-       def _consume_error_line(self, line: str) -> None:
-           if line == "":
-               if (self._event_type or "").lower() == "error":
-                   self.saw_error = True
-               self._event_type = None
-               return
-           if line.startswith(":"):
-               return
-           if line.startswith("event:"):
-               self._event_type = line[6:].strip() or None
-               return
-           if line.startswith("data:"):
-               payload = line[5:]
-               if payload.startswith(" "):
-                   payload = payload[1:]
-               if payload.lstrip().startswith("{"):
-                   _, is_error = _extract_approved_payload_text(payload)
-                   if is_error:
-                       self.saw_error = True
-
-       def _consume_text(self, text: str, *, final: bool = False, error_only: bool = False) -> None:
-           if not self._seen_text and text:
-               self._seen_text = True
-               if text.startswith("\ufeff"):
-                   text = text[1:]
-           self._line_buf += text
-           pos = 0
-           buf = self._line_buf
-           handler = self._consume_error_line if error_only else self._consume_line
-           for match in _LINE_END_RE.finditer(buf):
-               if match.group(0) == "\r" and match.end() == len(buf) and not final:
-                   break  # wait for next chunk in case \r is split across \r\n
-               handler(buf[pos : match.start()])
-               pos = match.end()
-               if self.saw_error:
-                   self._line_buf = ""
-                   return
-           self._line_buf = buf[pos:]
-           if error_only and len(self._line_buf) > _ERROR_SCAN_STEP:
-               self._line_buf = ""
-               self._skip_long_line = True
-
-       def _scan_error_bytes(self, byte_mv: memoryview) -> None:
-           # O(1) bounded scan after preview budget is exhausted so late event: error is never missed
-           for offset in range(0, len(byte_mv), _ERROR_SCAN_STEP):
-               if self.saw_error:
-                   return
-               with byte_mv[offset : offset + _ERROR_SCAN_STEP] as step:
-                   if self._skip_long_line:
-                       raw = bytes(step)
-                       nl = raw.find(b"\n")
-                       cr = raw.find(b"\r")
-                       if nl == -1 and cr == -1:
-                           continue
-                       idx = nl if cr == -1 else (cr if nl == -1 else min(nl, cr))
-                       self._skip_long_line = False
-                       self._decoder.reset()
-                       self._line_buf = "_"  # preserve skipped non-empty line before terminator
-                       decoded = self._decoder.decode(raw[idx:], final=False)
-                   else:
-                       decoded = self._decoder.decode(step, final=False)
-               self._consume_text(decoded, error_only=True)
-
-       def _scan_error_str(self, text: str) -> None:
-           for offset in range(0, len(text), _ERROR_SCAN_STEP):
-               if self.saw_error:
-                   return
-               step = text[offset : offset + _ERROR_SCAN_STEP]
-               if self._skip_long_line:
-                   nl = step.find("\n")
-                   cr = step.find("\r")
-                   if nl == -1 and cr == -1:
-                       continue
-                   idx = nl if cr == -1 else (cr if nl == -1 else min(nl, cr))
-                   self._skip_long_line = False
-                   self._line_buf = "_"
-                   step = step[idx:]
-               self._consume_text(step, error_only=True)
-
-       def feed(self, chunk) -> None:
-           if self.saw_error:
-               return
-           if isinstance(chunk, (bytes, bytearray, memoryview)):
-               own_mv = None if isinstance(chunk, memoryview) else memoryview(chunk)
-               mv = chunk if own_mv is None else own_mv
-               byte_mv = mv if (mv.ndim == 1 and mv.format == "B") else mv.cast("B")
-               try:
-                   if self.truncated:
-                       self._scan_error_bytes(byte_mv)
-                       return
-                   if len(byte_mv) > self._bytes_remaining:
-                       split_at = self._bytes_remaining
-                       with byte_mv[:split_at] as head:
-                           decoded = self._decoder.decode(head, final=False)
-                       self._bytes_remaining = 0
-                       self._consume_text(decoded)
-                       self._enter_error_scan_mode()
-                       with byte_mv[split_at:] as rest:
-                           self._scan_error_bytes(rest)
-                       return
-                   self._bytes_remaining -= len(byte_mv)
-                   decoded = self._decoder.decode(byte_mv, final=False)
-                   self._consume_text(decoded)
-                   return
-               finally:
-                   if byte_mv is not mv:
-                       byte_mv.release()
-                   if own_mv is not None:
-                       own_mv.release()
-           if isinstance(chunk, str):
-               if self.truncated:
-                   self._scan_error_str(chunk)
-                   return
-               if len(chunk) > self._chars_remaining:
-                   split_at = self._chars_remaining
-                   self._chars_remaining = 0
-                   self._consume_text(chunk[:split_at])
-                   self._enter_error_scan_mode()
-                   self._scan_error_str(chunk[split_at:])
-                   return
-               self._chars_remaining -= len(chunk)
-               self._consume_text(chunk)
-               return
-           # For sse-starlette EventSourceResponse dict frames (never pass raw dicts to StreamingResponse)
-           if isinstance(chunk, dict):
-               event_type = chunk.get("event", "message")
-               if isinstance(event_type, str) and event_type.lower() == "error":
-                   self.saw_error = True
-                   return
-               if isinstance(event_type, str) and event_type in ALLOWED_SSE_EVENTS:
-                   if "data" in chunk:
-                       raw_data = chunk["data"]
-                       if isinstance(raw_data, str) and len(raw_data) > MAX_DECODE_BYTES:
-                           head = raw_data[:MAX_DECODE_BYTES].lstrip()
-                           if not head or head.startswith(("{", "[")):
-                               self._enter_error_scan_mode()
-                               return
-                           if not self.truncated:
-                               self._append_reply(raw_data[:MAX_SANITIZE_CHARS])
-                           self._enter_error_scan_mode()
-                           return
-                       extracted, is_error = _extract_approved_payload_text(raw_data)
-                   else:
-                       extracted, is_error = _extract_approved_dict_text(chunk)
-                   if is_error:
-                       self.saw_error = True
-                       return
-                   if extracted and not self.truncated:
-                       self._append_reply(extracted)
-
-       def finish(self, *, completed: bool) -> str:
-           if completed and not self.saw_error:
-               tail = self._decoder.decode(b"", final=True)
-               self._consume_text(tail, final=True, error_only=self.truncated)
-           sanitized, self.truncated = _sanitize_and_bound(
-               "".join(self._parts),
-               already_truncated=self.truncated,
-           )
-           return sanitized
+   def _format_sse(ev) -> str:
+       # Wire encoder stays separate from telemetry; replace with your app's SSE serializer
+       raw_kind = ev.get("kind", "message") if isinstance(ev, dict) else getattr(ev, "kind", "message")
+       kind = raw_kind.replace("\r", "").replace("\n", "") if isinstance(raw_kind, str) and raw_kind else "message"
+       payload = (
+           (ev.get("text", "") if isinstance(ev, dict) else getattr(ev, "text", ""))
+           if kind == "delta"
+           else {"kind": kind}
+       )
+       return f"event: {kind}\ndata: {json.dumps(payload)}\n\n"
 
 
    async def chat(req):
-       # event_gen(req) yields valid SSE-formatted str, bytes, or memoryview frames
-       # (convert upstream bytearray chunks with bytes(chunk) before yielding to StreamingResponse)
+       # event_gen(req) yields typed app events (kind in {"delta", "done", "error", "debug"})
        async def traced_gen():
-           collector = _SSEPreviewCollector()
-           # Authoritative stream completion state (also combine your app's own error/abort flag if any)
+           preview_parts: list[str] = []
+           buffered_len = 0
            completed = False
+           saw_done = False
+           saw_error = False
            capture_failed = False
+           preview_truncated = False
            input_truncated = False
            with neatlogs.trace(
                "chat",
@@ -454,39 +172,58 @@ For each function, answer in order:
                prompt_version="chat-v2",
            ) as span:
                try:
-                   input_projection = _project_request_input(req)
-                   input_truncated = bool(input_projection.get("truncated"))
+                   input_projection, input_truncated = _project_request_input(req)
                    span.set_attribute("input.value", json.dumps(input_projection))
                except Exception:
                    pass  # input projection / attribute errors must never disrupt the stream
                try:
                    async for ev in event_gen(req):
                        try:
-                           collector.feed(ev)
+                           kind = ev.get("kind") if isinstance(ev, dict) else getattr(ev, "kind", None)
+                           if isinstance(kind, str) and len(kind) <= 32:
+                               if kind == "error":
+                                   saw_error = True  # always tracked, even after preview_truncated
+                               elif kind == "done":
+                                   saw_done = True
+                               elif kind == "delta" and not preview_truncated and not saw_error:
+                                   text = ev.get("text") if isinstance(ev, dict) else getattr(ev, "text", None)
+                                   if isinstance(text, str) and text:
+                                       remaining = MAX_SANITIZE_CHARS - buffered_len
+                                       if len(text) > remaining:
+                                           preview_parts.append(text[:remaining])
+                                           buffered_len = MAX_SANITIZE_CHARS
+                                           preview_truncated = True
+                                       else:
+                                           preview_parts.append(text)
+                                           buffered_len += len(text)
                        except Exception:
-                           capture_failed = True  # telemetry errors must never disrupt the stream
-                       yield ev  # leave yielded wire chunks untouched
+                           capture_failed = True  # telemetry errors must never disrupt SSE delivery
+                       yield _format_sse(ev)  # leave yielded wire frames untouched
                    completed = True
                finally:
                    preview = ""
                    try:
-                       preview = collector.finish(completed=completed)
+                       preview, preview_truncated = _sanitize_and_bound(
+                           "".join(preview_parts),
+                           already_truncated=preview_truncated,
+                       )
                    except Exception:
                        capture_failed = True
                    has_answer = bool(preview.strip())
                    stream_incomplete = (
                        (not completed)
+                       or (not saw_done)
+                       or saw_error
                        or capture_failed
-                       or collector.saw_error
                        or (not has_answer)
                    )
-                   capture_truncated = input_truncated or collector.truncated
+                   capture_truncated = input_truncated or preview_truncated
                    try:
                        span.set_attribute("neatlogs.capture.truncated", capture_truncated)
                        span.set_attribute("neatlogs.stream.incomplete", stream_incomplete)
                        if not stream_incomplete and has_answer:
                            output_payload: dict[str, object] = {"reply": preview}
-                           if collector.truncated:
+                           if preview_truncated:
                                output_payload["truncated"] = True
                            span.set_attribute("output.value", json.dumps(output_payload))
                    except Exception:
@@ -494,12 +231,10 @@ For each function, answer in order:
        return StreamingResponse(traced_gen(), media_type="text/event-stream")
    ```
 
-   Keep streaming instrumentation non-invasive, sanitized, and bounded:
-   - **Export approved, sanitized application-level projections — never raw request text or raw wire payloads:** Project only allowlisted, bounded, PII-redacted application fields for `input.value` and dispatch SSE frames only on the blank-line terminator (per WHATWG SSE spec, so `event: debug` appearing after `data:` is still filtered). For JSON/dict `data:` payloads, extract only allowlisted assistant text fields (`text`, `delta`, `content`) rather than exporting full JSON or `metadata`. Sanitize emails, bearer tokens, and API keys *before* clipping to `MAX_PREVIEW_CHARS` (and re-bound after redaction so redaction expansion still respects the cap and sets `truncated`).
-   - **Bound raw byte decoding & preserve split UTF-8:** Cap raw bytes (`bytes`, `bytearray`, or `memoryview`) buffered for preview text into `codecs.getincrementaldecoder("utf-8")(errors="replace")` *before* decoding (so a multi-megabyte byte chunk never allocates megabytes and multi-byte UTF-8 characters like `€` split across chunks decode cleanly), while continuing a constant-memory error-tag scan so a late terminal `event: error` is never missed after the preview budget is exhausted.
-   - **Fail-open telemetry capture & attribute writes:** Guard identity attribute lookups (`conversation_id`/`user_id`), input projection, preview extraction, and `span.set_attribute(...)` calls in `try: ... except Exception: pass` and leave yielded wire chunks untouched so capture/attribute failures or raising property getters can never disrupt or terminate the application stream.
-   - **Match the response class to your chunk type:** Starlette's `StreamingResponse` accepts only `str`, `bytes`, or `memoryview` chunks (passing raw `dict` or `bytearray` frames raises `AttributeError` — convert upstream `bytearray` chunks via `bytes(chunk)` before yielding) and requires `media_type="text/event-stream"` for SSE. If your generator yields `dict` frames (e.g. `{"event": "message", "data": "..."}`), return `EventSourceResponse(traced_gen())` from `sse-starlette` instead or serialize them to SSE `str`/`bytes` frames.
-   - **Use authoritative completion state & emit canonical Doctor flags:** Track authoritative stream completion independently of preview capture (`completed`, `collector.saw_error`, `capture_failed`, plus any app-level abort/error flag) and input/preview truncation (`capture_truncated`), emit `neatlogs.capture.truncated` and `neatlogs.stream.incomplete`, and omit final root `output.value` unless a nonempty completed answer is known (never emit `{"reply": ""}` or publish a partial prefix after an error, cancellation, or capture failure — prefer recording the app's existing sanitized final assembled answer when available).
+   Wrap the application event generator before SSE wire encoding so completion/error state is authoritative and never depends on parsing raw wire frames; use `StreamingResponse(..., media_type="text/event-stream")` for formatted `str`/`bytes` frames (or `EventSourceResponse` from `sse-starlette` if yielding dict frames).
+   - **Approved projections & pre-clip redaction:** Project only allowlisted application fields (`req.message`, `delta` text — ignoring `debug`/internal events and private `metadata`), and sanitize emails, bearer tokens, and API keys *before* clipping to `MAX_PREVIEW_CHARS` (re-bounding after redaction and slicing `text[:remaining]` so multi-megabyte chunks stay bounded).
+   - **Fail-open telemetry:** Guard identity lookups (`conversation_id`/`user_id`), input projection, event capture, sanitization, and `span.set_attribute(...)` in `try/except Exception` so telemetry errors never disrupt SSE delivery or alter yielded wire frames.
+   - **Authoritative completion & canonical Doctor flags:** Track `completed`, `saw_done`, `saw_error` (even after `preview_truncated`), and `capture_failed` independently of preview buffering; emit `neatlogs.capture.truncated` and `neatlogs.stream.incomplete`, and omit `output.value` unless a nonempty completed answer is known (never publish `{"reply": ""}` or a partial prefix after an error, cancellation, or capture failure).
 
 ## Clean Root I/O & Provenance Contract
 
